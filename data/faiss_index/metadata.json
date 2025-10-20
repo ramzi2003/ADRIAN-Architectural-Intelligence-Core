@@ -1,0 +1,7 @@
+{
+  "dimension": 384,
+  "index_type": "IndexIDMap(IndexFlatL2)",
+  "total_vectors": 3,
+  "updated_at": "2025-10-08T05:25:32",
+  "version": "1.0"
+}

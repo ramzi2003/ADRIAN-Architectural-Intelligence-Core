@@ -33,18 +33,19 @@ transformers>=4.37.2
 # Google Gemini API (Cloud LLM)
 google-generativeai>=0.3.2
 
-# Speech-to-Text (future phases)
-# openai-whisper==20231117  # Uncomment when implementing STT
-# vosk==0.3.45  # Alternative STT engine
+# Audio Processing (Phase 2 - Active)
+sounddevice>=0.4.6  # Microphone capture and playback
+soundfile>=0.12.1  # Audio file I/O (WAV, FLAC, OGG)
 
-# Text-to-Speech (future phases)
-# pyttsx3==2.90  # Basic TTS
-# TTS==0.21.1  # Coqui TTS (advanced)
+# Text-to-Speech (Phase 2 - Active)
+TTS>=0.22.0  # Coqui TTS (high quality, local)
 
-# Audio Processing (future phases)
-# pyaudio==0.2.14  # Microphone capture
-# sounddevice==0.4.6  # Alternative audio I/O
-# webrtcvad==2.0.10  # Voice Activity Detection
+# Speech-to-Text (Phase 2 - Will be activated in Task 4)
+# openai-whisper>=20231117  # Uncomment when implementing STT
+# vosk>=0.3.45  # Alternative STT engine
+
+# Voice Activity Detection (Phase 2 - Active)
+webrtcvad>=2.0.10  # WebRTC VAD for speech detection
 
 # Cryptography & Security
 cryptography>=42.0.0

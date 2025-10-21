@@ -21,6 +21,13 @@ except ImportError:
     VADState = None
     VAD_CHUNK_SIZE = 480
 
+# Import Hotword utilities
+try:
+    from .hotword_utils import HotwordDetector, CHUNK_SIZE as HOTWORD_CHUNK_SIZE
+except ImportError:
+    HotwordDetector = None
+    HOTWORD_CHUNK_SIZE = 512
+
 logger = get_logger("io-service.audio")
 
 # Audio configuration constants
@@ -228,10 +235,13 @@ class AudioStream:
         chunk_size: int = CHUNK_SIZE,
         enable_vad: bool = True,
         vad_aggressiveness: int = 1,
-        vad_callback: Optional[Callable[[bool, str], None]] = None
+        vad_callback: Optional[Callable[[bool, str], None]] = None,
+        enable_hotword: bool = True,
+        hotword_sensitivity: float = 0.7,
+        hotword_callback: Optional[Callable[[], None]] = None
     ):
         """
-        Initialize audio stream with optional VAD support.
+        Initialize audio stream with optional VAD and hotword detection support.
         
         Args:
             callback: Function called with each audio chunk
@@ -242,6 +252,9 @@ class AudioStream:
             enable_vad: Enable voice activity detection
             vad_aggressiveness: VAD sensitivity (0-3)
             vad_callback: Optional callback for VAD state changes (is_speech, state)
+            enable_hotword: Enable hotword detection ("ADRIAN")
+            hotword_sensitivity: Hotword detection sensitivity (0.1-1.0)
+            hotword_callback: Optional callback when hotword detected
         """
         self.callback = callback
         self.device = device
@@ -267,14 +280,47 @@ class AudioStream:
         
         if enable_vad and not self.enable_vad:
             logger.warning("VAD requested but not available - continuing without VAD")
+        
+        # Hotword detection support
+        self.enable_hotword = enable_hotword and HotwordDetector is not None
+        self.hotword_callback = hotword_callback
+        self.hotword_detector: Optional[HotwordDetector] = None
+        
+        if self.enable_hotword:
+            try:
+                self.hotword_detector = HotwordDetector(
+                    callback=hotword_callback,
+                    sensitivity=hotword_sensitivity,
+                    enable_debug=True
+                )
+                logger.info(f"Hotword detection enabled with sensitivity={hotword_sensitivity}")
+            except Exception as e:
+                logger.error(f"Failed to initialize hotword detector: {e}")
+                self.enable_hotword = False
+                self.hotword_detector = None
+        
+        if enable_hotword and not self.enable_hotword:
+            logger.warning("Hotword detection requested but not available - continuing without hotword detection")
     
     def _audio_callback(self, indata, frames, time_info, status):
         """Internal callback for sounddevice stream with VAD processing."""
+        # COMPREHENSIVE DEBUGGING: Track the source of frame length issues
         if status:
-            logger.warning(f"Audio stream status: {status}")
+            logger.warning(f"[audio_utils.py:308] Audio stream status: {status}")
+        
+        # DEBUG: Log what we receive from sounddevice
+        if not hasattr(self, '_callback_debug_counter'):
+            self._callback_debug_counter = 0
+        self._callback_debug_counter += 1
+        
+        if self._callback_debug_counter <= 3:  # Log first 3 callbacks
+            logger.info(f"[audio_utils.py:305] _audio_callback #{self._callback_debug_counter} - indata.shape: {indata.shape}, frames: {frames}, dtype: {indata.dtype}")
         
         # Get audio data as mono numpy array
         audio_data = indata.copy()
+        original_shape = audio_data.shape
+        original_size = len(audio_data)
+        
         if len(audio_data.shape) > 1:
             audio_data = audio_data[:, 0]  # Take first channel if stereo
         
@@ -283,6 +329,10 @@ class AudioStream:
             # Convert from float to int16
             max_val = np.iinfo(np.int16).max
             audio_data = (audio_data * max_val).astype(np.int16)
+        
+        # DEBUG: Log audio data after processing
+        if self._callback_debug_counter <= 3:
+            logger.info(f"[audio_utils.py:320] After processing - audio_data.shape: {audio_data.shape}, size: {len(audio_data)}, expected_chunk_size: {self.chunk_size}")
         
         # Process VAD if enabled
         if self.enable_vad and self.vad_manager:
@@ -306,6 +356,31 @@ class AudioStream:
             except Exception as e:
                 logger.error(f"Error in VAD processing: {e}")
         
+        # Process hotword detection if enabled
+        if self.enable_hotword and self.hotword_detector:
+            try:
+                # DEBUG: Log what we're sending to hotword detector
+                if hasattr(self, '_callback_debug_counter') and self._callback_debug_counter <= 3:
+                    logger.info(f"[audio_utils.py:364] Sending to hotword_detector.process_audio_chunk() - size: {len(audio_data)}")
+                
+                # Pass the audio data to hotword detector (it handles buffering internally)
+                hotword_detected = self.hotword_detector.process_audio_chunk(audio_data)
+                
+                if hotword_detected:
+                    logger.info("Hotword detected!")
+                        
+            except Exception as e:
+                error_msg = str(e)
+                # COMPREHENSIVE ERROR DEBUGGING
+                logger.error(f"[audio_utils.py:377] ERROR in hotword processing - File: audio_utils.py, Line: 377, Error: {error_msg}")
+                logger.error(f"[audio_utils.py:378] Context - audio_data size: {len(audio_data)}, chunk_size: {self.chunk_size}")
+                logger.error(f"[audio_utils.py:379] Full exception details: {type(e).__name__}: {e}")
+                
+                if "Invalid frame length" in error_msg:
+                    logger.error(f"[audio_utils.py:381] FRAME LENGTH ERROR - This should be handled by conversion function!")
+                else:
+                    logger.error(f"[audio_utils.py:384] Other error in hotword processing: {e}")
+        
         # Call user callback with audio data (copy to prevent memory retention)
         try:
             # Pass a copy to prevent callback from accidentally retaining the data
@@ -326,6 +401,7 @@ class AudioStream:
             return
         
         logger.info("Starting audio stream...")
+        logger.info(f"[audio_utils.py:406] Stream config - device: {self.device}, channels: {self.channels}, sample_rate: {self.sample_rate}, blocksize: {self.chunk_size}")
         
         try:
             self.stream = sd.InputStream(
@@ -336,10 +412,19 @@ class AudioStream:
                 dtype=DTYPE,
                 callback=self._audio_callback
             )
+            logger.info(f"[audio_utils.py:415] Stream created successfully with blocksize: {self.chunk_size}")
             
             self.stream.start()
             self.is_running = True
-            logger.info("Audio stream started")
+            
+            # Start hotword detection if enabled
+            if self.enable_hotword and self.hotword_detector:
+                if self.hotword_detector.start():
+                    logger.info("Audio stream and hotword detection started")
+                else:
+                    logger.warning("Audio stream started but hotword detection failed")
+            else:
+                logger.info("Audio stream started")
             
         except Exception as e:
             logger.error(f"Failed to start audio stream: {e}")
@@ -351,6 +436,10 @@ class AudioStream:
             return
         
         logger.info("Stopping audio stream...")
+        
+        # Stop hotword detection first
+        if self.enable_hotword and self.hotword_detector:
+            self.hotword_detector.stop()
         
         if self.stream:
             self.stream.stop()
@@ -386,6 +475,19 @@ class AudioStream:
         if self.enable_vad and self.vad_manager:
             self.vad_manager.reset()
             logger.debug("VAD state reset")
+    
+    def get_hotword_status(self) -> dict:
+        """Get current hotword detection status (hotword detection must be enabled)."""
+        if not self.enable_hotword or not self.hotword_detector:
+            return {"enabled": False, "status": "disabled"}
+        
+        status = self.hotword_detector.get_status()
+        status["enabled"] = True
+        return status
+    
+    def is_hotword_enabled(self) -> bool:
+        """Check if hotword detection is enabled and working."""
+        return self.enable_hotword and self.hotword_detector is not None
     
     def get_memory_usage(self) -> dict:
         """Get memory usage information for monitoring."""

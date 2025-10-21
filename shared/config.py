@@ -6,6 +6,7 @@ import os
 from typing import Optional
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pathlib import Path
 
 
 class Settings(BaseSettings):
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-pro"
     
+    # Porcupine (Hotword Detection)
+    picovoice_access_key: Optional[str] = None
+    
     # Service Ports
     io_service_port: int = 8001
     processing_service_port: int = 8002
@@ -62,6 +66,20 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     """Get cached settings instance."""
+    # Find .env file in project root
+    current_dir = Path.cwd()
+    
+    # Look for .env file in current directory and parent directories
+    for _ in range(5):  # Look up to 5 levels up
+        env_path = current_dir / ".env"
+        if env_path.exists():
+            # Set the working directory to where .env is found
+            os.environ['PWD'] = str(current_dir)
+            break
+        current_dir = current_dir.parent
+        if current_dir == current_dir.parent:  # Reached root
+            break
+    
     return Settings()
 
 

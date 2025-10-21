@@ -47,6 +47,9 @@ TTS>=0.22.0  # Coqui TTS (high quality, local)
 # Voice Activity Detection (Phase 2 - Active)
 webrtcvad>=2.0.10  # WebRTC VAD for speech detection
 
+# Hotword Detection (Phase 2 - Active)
+pvporcupine>=3.0.0  # Porcupine for wake word detection
+
 # Cryptography & Security
 cryptography>=42.0.0
 python-jose[cryptography]>=3.3.0

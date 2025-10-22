@@ -40,9 +40,9 @@ soundfile>=0.12.1  # Audio file I/O (WAV, FLAC, OGG)
 # Text-to-Speech (Phase 2 - Active)
 TTS>=0.22.0  # Coqui TTS (high quality, local)
 
-# Speech-to-Text (Phase 2 - Will be activated in Task 4)
-# openai-whisper>=20231117  # Uncomment when implementing STT
-# vosk>=0.3.45  # Alternative STT engine
+# Speech-to-Text (Phase 2 - Active)
+openai-whisper>=20231117  # OpenAI Whisper for high-quality STT
+# vosk>=0.3.45  # Alternative STT engine (lighter but less accurate)
 
 # Voice Activity Detection (Phase 2 - Active)
 webrtcvad>=2.0.10  # WebRTC VAD for speech detection

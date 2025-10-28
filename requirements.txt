@@ -36,6 +36,7 @@ google-generativeai>=0.3.2
 # Audio Processing (Phase 2 - Active)
 sounddevice>=0.4.6  # Microphone capture and playback
 soundfile>=0.12.1  # Audio file I/O (WAV, FLAC, OGG)
+scipy>=1.11.0  # Signal processing for voice effects
 
 # Text-to-Speech (Phase 2 - Active)
 TTS>=0.22.0  # Coqui TTS (high quality, local)

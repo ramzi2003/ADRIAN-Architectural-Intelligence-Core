@@ -38,7 +38,7 @@ class HotwordDetector:
         callback: Optional[Callable[[], None]] = None,
         sensitivity: float = 0.7,
         cooldown_period: float = 2.5,
-        enable_debug: bool = True
+        enable_debug: bool = False  # Disabled by default to reduce log spam
     ):
         """
         Initialize hotword detector.
@@ -53,6 +53,7 @@ class HotwordDetector:
         self.sensitivity = max(0.1, min(1.0, sensitivity))
         self.cooldown_period = cooldown_period
         self.enable_debug = enable_debug
+        self._process_count = 0  # Track processing for occasional logging
         
         # State tracking
         self.is_running = False
@@ -295,64 +296,25 @@ class HotwordDetector:
         Returns:
             Audio data resized to self.chunk_size
         """
-        # COMPREHENSIVE DEBUGGING: Track conversion function
-        if not hasattr(self, '_convert_debug_counter'):
-            self._convert_debug_counter = 0
-        self._convert_debug_counter += 1
-        
-        if self._convert_debug_counter <= 3:
-            logger.info(f"[hotword_utils.py:283] _convert_to_correct_chunk_size #{self._convert_debug_counter} - File: hotword_utils.py, Line: 283")
-            logger.info(f"[hotword_utils.py:284] Input - size: {len(audio_data)}, dtype: {audio_data.dtype}, shape: {audio_data.shape}")
-            logger.info(f"[hotword_utils.py:285] Target chunk_size: {self.chunk_size}")
-        
         if len(audio_data) == 0:
-            logger.warning(f"[hotword_utils.py:290] Empty audio data in conversion function")
             return np.array([], dtype=np.int16)
         
-        # Ensure int16 format
-        original_dtype = audio_data.dtype
+        # Ensure int16 format and flatten
         if audio_data.dtype != np.int16:
             audio_data = audio_data.astype(np.int16)
         audio_data = audio_data.flatten()
         
         target_size = self.chunk_size
         
-        if self._convert_debug_counter <= 3:
-            logger.info(f"[hotword_utils.py:301] After flatten - size: {len(audio_data)}, target_size: {target_size}")
-        
+        # Resize to target size
         if len(audio_data) == target_size:
-            result = audio_data.copy()
-            if self._convert_debug_counter <= 3:
-                logger.info(f"[hotword_utils.py:306] CASE: Exact size match - no change needed")
+            return audio_data.copy()
         elif len(audio_data) > target_size:
-            # Take first target_size samples
-            result = audio_data[:target_size].copy()
-            if self._convert_debug_counter <= 3:
-                logger.info(f"[hotword_utils.py:310] CASE: Truncating from {len(audio_data)} to {target_size}")
+            return audio_data[:target_size].copy()
         else:
-            # Pad with zeros to reach target size
+            # Pad with zeros
             padding_needed = target_size - len(audio_data)
-            result = np.concatenate([audio_data, np.zeros(padding_needed, dtype=np.int16)])
-            if self._convert_debug_counter <= 3:
-                logger.info(f"[hotword_utils.py:315] CASE: Padding from {len(audio_data)} to {target_size}")
-        
-        # Final safety check
-        if len(result) != target_size:
-            logger.error(f"[hotword_utils.py:318] CRITICAL: Conversion safety check failed - File: hotword_utils.py, Line: 318")
-            logger.error(f"[hotword_utils.py:319] Got {len(result)}, expected {target_size}")
-            # Force correct size as last resort
-            if len(result) > target_size:
-                result = result[:target_size]
-                logger.error(f"[hotword_utils.py:322] Forced truncation to {len(result)}")
-            else:
-                padding = np.zeros(target_size - len(result), dtype=np.int16)
-                result = np.concatenate([result, padding])
-                logger.error(f"[hotword_utils.py:325] Forced padding to {len(result)}")
-        
-        if self._convert_debug_counter <= 3:
-            logger.info(f"[hotword_utils.py:328] FINAL RESULT - size: {len(result)}, target: {target_size}, match: {len(result) == target_size}")
-        
-        return result
+            return np.concatenate([audio_data, np.zeros(padding_needed, dtype=np.int16)])
     
     def process_audio_chunk(self, audio_data: np.ndarray) -> bool:
         """
@@ -365,144 +327,43 @@ class HotwordDetector:
         Returns:
             True if hotword detected, False otherwise
         """
-        # COMPREHENSIVE DEBUGGING: Track the exact issue
-        if not hasattr(self, '_process_debug_counter'):
-            self._process_debug_counter = 0
-        self._process_debug_counter += 1
-        
-        if self._process_debug_counter <= 3:  # Log first 3 calls
-            logger.info(f"[hotword_utils.py:373] process_audio_chunk #{self._process_debug_counter} - File: hotword_utils.py, Line: 373")
-            logger.info(f"[hotword_utils.py:374] Input - audio_data.shape: {audio_data.shape}, size: {len(audio_data)}, dtype: {audio_data.dtype}")
-            logger.info(f"[hotword_utils.py:375] Expected chunk_size: {self.chunk_size}, is_running: {self.is_running}, porcupine: {self.porcupine is not None}")
-            logger.info(f"[hotword_utils.py:376] ROOT CAUSE CHECK: Input size {len(audio_data)} -> should convert to {self.chunk_size}")
-        
         if not self.is_running or not self.porcupine:
-            if self._process_debug_counter <= 3:
-                logger.warning(f"[hotword_utils.py:340] Early return - not running or no porcupine")
             return False
         
         # Check cooldown period
         current_time = time.time()
         if current_time - self.last_detection_time < self.cooldown_period:
-            if self._process_debug_counter <= 3:
-                logger.debug(f"[hotword_utils.py:345] In cooldown period")
             return False
         
         if len(audio_data) == 0:
-            if self._process_debug_counter <= 3:
-                logger.warning(f"[hotword_utils.py:349] Empty audio data")
             return False
         
         try:
-            # CRITICAL DEBUG: Log what we receive before any processing
-            if not hasattr(self, '_conversion_log_counter'):
-                self._conversion_log_counter = 0
-            self._conversion_log_counter += 1
-            
-            if self._conversion_log_counter <= 5:  # Log first 5 conversions in detail
-                logger.info(f"[hotword_utils.py:397] BEFORE CONVERSION - Input: {len(audio_data)} samples")
-            
             # Convert to the exact size Porcupine expects
             processed_chunk = self._convert_to_correct_chunk_size(audio_data)
             
-            if self._conversion_log_counter <= 5:  # Log first 5 conversions in detail
-                logger.info(f"[hotword_utils.py:403] AFTER CONVERSION - Input: {len(audio_data)}, Output: {len(processed_chunk)}, Target: {self.chunk_size}")
-                logger.info(f"[hotword_utils.py:404] CONVERSION VERIFICATION: {len(processed_chunk) == self.chunk_size}")
-            
             if len(processed_chunk) != self.chunk_size:
-                logger.error(f"[hotword_utils.py:364] CRITICAL CONVERSION FAILURE - File: hotword_utils.py, Line: 364")
-                logger.error(f"[hotword_utils.py:365] Got {len(processed_chunk)}, expected {self.chunk_size}")
+                logger.error(f"Conversion failure: got {len(processed_chunk)}, expected {self.chunk_size}")
                 return False
             
-            # Convert to bytes for Porcupine - ensure correct format
-            # CRITICAL: Make sure processed_chunk is exactly the right size
-            processed_chunk = processed_chunk.astype(np.int16)
+            # Ensure correct format for Porcupine
+            processed_chunk = processed_chunk.astype(np.int16).flatten()
             
-            # Final safety check - this should never fail, but let's be extra sure
+            # Final verification
             if len(processed_chunk) != self.chunk_size:
-                logger.error(f"[hotword_utils.py:418] CRITICAL: Size mismatch before bytes conversion!")
-                logger.error(f"[hotword_utils.py:419] processed_chunk: {len(processed_chunk)}, expected: {self.chunk_size}")
-                # Force the correct size as absolute last resort
-                if len(processed_chunk) > self.chunk_size:
-                    processed_chunk = processed_chunk[:self.chunk_size]
-                else:
-                    # Pad with zeros
-                    padding = np.zeros(self.chunk_size - len(processed_chunk), dtype=np.int16)
-                    processed_chunk = np.concatenate([processed_chunk, padding])
-                logger.warning(f"[hotword_utils.py:426] Forced size correction to {len(processed_chunk)}")
-            
-            # CRITICAL FIX: Porcupine expects numpy array of samples, NOT bytes!
-            # The error "expected 512 but received 1024" suggests Porcupine is counting
-            # the input as individual elements, so bytes (1024) vs samples (512)
-            
-            # Verify we have exactly the right number of samples
-            if len(processed_chunk) != self.chunk_size:
-                logger.error(f"[hotword_utils.py:432] CRITICAL: Sample count mismatch - File: hotword_utils.py, Line: 432")
-                logger.error(f"[hotword_utils.py:433] {len(processed_chunk)} samples != {self.chunk_size} expected")
+                logger.error(f"Final size check failed: got {len(processed_chunk)}, expected {self.chunk_size}")
                 return False
             
-            # DEBUG: Log before Porcupine process call
-            if self._conversion_log_counter <= 5:
-                logger.info(f"[hotword_utils.py:436] About to call porcupine.process() - File: hotword_utils.py, Line: 436")
-                logger.info(f"[hotword_utils.py:437] processed_chunk: {len(processed_chunk)} samples, dtype: {processed_chunk.dtype}")
-                logger.info(f"[hotword_utils.py:438] Expected: {self.chunk_size} samples")
-                logger.info(f"[hotword_utils.py:439] porcupine.frame_length: {getattr(self.porcupine, 'frame_length', 'unknown')}")
-            
-            # Process with Porcupine - FIXED: Pass numpy array directly
+            # Process with Porcupine
             try:
-                # FINAL DEBUG: Log exactly what we're sending to Porcupine
-                if self._conversion_log_counter <= 10:  # Log first 10 attempts
-                    logger.info(f"[hotword_utils.py:444] FINAL CHECK before porcupine.process() - FIXED VERSION")
-                    logger.info(f"[hotword_utils.py:445] processed_chunk samples: {len(processed_chunk)}, dtype: {processed_chunk.dtype}")
-                    logger.info(f"[hotword_utils.py:446] Expected: {self.chunk_size} samples")
-                    logger.info(f"[hotword_utils.py:447] porcupine.frame_length: {getattr(self.porcupine, 'frame_length', 'unknown')}")
-                
-                # CRITICAL FIX: Ensure proper numpy array format
-                # Make sure it's exactly what Porcupine expects
-                processed_chunk = processed_chunk.astype(np.int16).flatten()
-                
-                # Final verification
-                if len(processed_chunk) != self.chunk_size:
-                    logger.error(f"[hotword_utils.py:477] CRITICAL: Final size check failed!")
-                    logger.error(f"[hotword_utils.py:478] Got {len(processed_chunk)}, expected {self.chunk_size}")
-                    return False
-                
-                if self._conversion_log_counter <= 3:
-                    logger.info(f"[hotword_utils.py:480] FINAL CHECK - Passing to Porcupine:")
-                    logger.info(f"[hotword_utils.py:481] processed_chunk: {len(processed_chunk)} samples, dtype: {processed_chunk.dtype}")
-                    logger.info(f"[hotword_utils.py:482] Shape: {processed_chunk.shape}")
-                    logger.info(f"[hotword_utils.py:483] First 5 values: {processed_chunk[:5]}")
-                
-                # Try numpy array first, fallback to bytes if needed
-                try:
-                    keyword_index = self.porcupine.process(processed_chunk)
-                    if self._conversion_log_counter <= 3:
-                        logger.info(f"[hotword_utils.py:487] SUCCESS with numpy array format!")
-                except Exception as numpy_error:
-                    if "Invalid frame length" in str(numpy_error):
-                        if self._conversion_log_counter <= 3:
-                            logger.info(f"[hotword_utils.py:491] NumPy format failed, trying bytes format as fallback")
-                        # Fallback to bytes (though this shouldn't be needed)
-                        audio_bytes = processed_chunk.tobytes()
-                        keyword_index = self.porcupine.process(audio_bytes)
-                        if self._conversion_log_counter <= 3:
-                            logger.info(f"[hotword_utils.py:495] SUCCESS with bytes format fallback!")
-                    else:
-                        raise numpy_error
-                if self._conversion_log_counter <= 5:
-                    logger.info(f"[hotword_utils.py:460] Porcupine.process() succeeded, keyword_index: {keyword_index}")
-            except Exception as porcupine_error:
-                logger.error(f"[hotword_utils.py:462] PORCUPINE PROCESS ERROR - File: hotword_utils.py, Line: 462")
-                logger.error(f"[hotword_utils.py:463] Error type: {type(porcupine_error).__name__}, Message: {str(porcupine_error)}")
-                logger.error(f"[hotword_utils.py:464] Context - audio_bytes: {len(audio_bytes)} bytes, processed_chunk: {len(processed_chunk)} samples")
-                logger.error(f"[hotword_utils.py:465] Expected chunk_size: {self.chunk_size}, porcupine.frame_length: {getattr(self.porcupine, 'frame_length', 'unknown')}")
-                
-                # CRITICAL DEBUG: Let's see what the actual byte content looks like
-                if self._conversion_log_counter <= 3:
-                    logger.error(f"[hotword_utils.py:467] DEBUG: First few bytes of audio_bytes: {audio_bytes[:16]}")
-                    logger.error(f"[hotword_utils.py:468] DEBUG: processed_chunk array: {processed_chunk[:10]}")
-                
-                raise  # Re-raise to be caught by outer try-catch
+                keyword_index = self.porcupine.process(processed_chunk)
+            except Exception as numpy_error:
+                # Fallback to bytes format if numpy array fails
+                if "Invalid frame length" in str(numpy_error):
+                    audio_bytes = processed_chunk.tobytes()
+                    keyword_index = self.porcupine.process(audio_bytes)
+                else:
+                    raise numpy_error
             
             if keyword_index >= 0:
                 # Hotword detected!

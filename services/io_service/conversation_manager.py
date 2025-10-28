@@ -53,7 +53,8 @@ class ConversationManager:
     def __init__(self, 
                  conversation_timeout: float = 30.0,  # 30 seconds of silence = back to idle
                  max_context_turns: int = 5,  # Remember last 5 exchanges
-                 confidence_threshold: float = 0.7):
+                 confidence_threshold: float = 0.7,
+                 stt_processor: Optional[STTProcessor] = None):
         """
         Initialize conversation manager.
         
@@ -61,10 +62,12 @@ class ConversationManager:
             conversation_timeout: Seconds of silence before returning to idle
             max_context_turns: Maximum number of conversation turns to remember
             confidence_threshold: Minimum confidence for accepting transcription
+            stt_processor: STTProcessor instance to use for transcription
         """
         self.conversation_timeout = conversation_timeout
         self.max_context_turns = max_context_turns
         self.confidence_threshold = confidence_threshold
+        self.stt_processor = stt_processor
         
         # State management
         self.current_state = ConversationState.IDLE
@@ -148,13 +151,21 @@ class ConversationManager:
         
         # Convert buffer to numpy array
         audio_data = np.array(list(self.audio_buffer), dtype=np.int16)
+        duration = len(audio_data) / 16000  # 16kHz sample rate
+        
+        logger.info(f"📊 Audio buffer: {len(audio_data)} samples ({duration:.2f}s)")
         
         # Check if we have enough audio (at least 0.5 seconds)
         if len(audio_data) < 8000:  # Less than 0.5 seconds at 16kHz
+            logger.warning(f"Audio too short: {duration:.2f}s")
             return "", 0.0, False
         
         # Transcribe audio
-        transcription, confidence, audio_quality, error_type = await speech_to_text(audio_data)
+        if self.stt_processor:
+            transcription, confidence, audio_quality, error_type = await self.stt_processor.transcribe_audio(audio_data)
+        else:
+            # Fallback to global function
+            transcription, confidence, audio_quality, error_type = await speech_to_text(audio_data)
         
         # Update context
         if self.current_context:

@@ -40,6 +40,28 @@ class Settings(BaseSettings):
     
     # Porcupine (Hotword Detection)
     picovoice_access_key: Optional[str] = None
+    hotword_sensitivity: float = 0.7  # 0.1-1.0
+    
+    # Speech-to-Text (Whisper)
+    whisper_model_name: str = "base"  # "tiny", "base", "small", "medium", "large"
+    whisper_device: str = "cpu"  # "cpu" or "cuda"
+    stt_confidence_threshold: float = 0.5  # 0.0-1.0
+    
+    # Conversation Manager
+    conversation_timeout_seconds: float = 30.0  # Seconds of silence before returning to idle
+    max_context_turns: int = 3  # Number of previous conversation turns to remember
+    
+    # Voice Activity Detection (VAD)
+    vad_aggressiveness: int = 1  # 0-3 (0=least aggressive, 3=most aggressive)
+    
+    # Text-to-Speech (Coqui TTS)
+    # Using fast VITS model with selected British male voice (p234)
+    tts_model_name: str = "tts_models/en/vctk/vits"  # Multi-speaker VITS (fast model, already downloaded)
+    tts_speaker: str = "p234"  # Chosen default voice
+    tts_use_voice_cloning: bool = False  # Disable XTTS cloning, use VCTK voices
+    tts_speed: float = 1.0  # Normal pace for clarity
+    tts_pitch_shift: float = -2.5  # Deeper, authoritative tone
+    tts_device: str = "cpu"  # "cpu" or "cuda"
     
     # Service Ports
     io_service_port: int = 8001

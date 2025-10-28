@@ -291,7 +291,7 @@ class AudioStream:
                 self.hotword_detector = HotwordDetector(
                     callback=hotword_callback,
                     sensitivity=hotword_sensitivity,
-                    enable_debug=True
+                    enable_debug=False  # Disable verbose debug logging
                 )
                 logger.info(f"Hotword detection enabled with sensitivity={hotword_sensitivity}")
             except Exception as e:
@@ -304,22 +304,19 @@ class AudioStream:
     
     def _audio_callback(self, indata, frames, time_info, status):
         """Internal callback for sounddevice stream with VAD processing."""
-        # COMPREHENSIVE DEBUGGING: Track the source of frame length issues
-        if status:
-            logger.warning(f"[audio_utils.py:308] Audio stream status: {status}")
-        
-        # DEBUG: Log what we receive from sounddevice
-        if not hasattr(self, '_callback_debug_counter'):
-            self._callback_debug_counter = 0
-        self._callback_debug_counter += 1
-        
-        if self._callback_debug_counter <= 3:  # Log first 3 callbacks
-            logger.info(f"[audio_utils.py:305] _audio_callback #{self._callback_debug_counter} - indata.shape: {indata.shape}, frames: {frames}, dtype: {indata.dtype}")
+        # Only log warnings/errors, not every callback
+        if status and status.input_overflow:
+            # Input overflow is common and not critical - log at debug level only occasionally
+            if not hasattr(self, '_overflow_count'):
+                self._overflow_count = 0
+            self._overflow_count += 1
+            if self._overflow_count % 100 == 1:  # Log every 100th overflow
+                logger.debug(f"Audio input overflow (count: {self._overflow_count})")
+        elif status:
+            logger.warning(f"Audio stream status: {status}")
         
         # Get audio data as mono numpy array
         audio_data = indata.copy()
-        original_shape = audio_data.shape
-        original_size = len(audio_data)
         
         if len(audio_data.shape) > 1:
             audio_data = audio_data[:, 0]  # Take first channel if stereo
@@ -329,10 +326,6 @@ class AudioStream:
             # Convert from float to int16
             max_val = np.iinfo(np.int16).max
             audio_data = (audio_data * max_val).astype(np.int16)
-        
-        # DEBUG: Log audio data after processing
-        if self._callback_debug_counter <= 3:
-            logger.info(f"[audio_utils.py:320] After processing - audio_data.shape: {audio_data.shape}, size: {len(audio_data)}, expected_chunk_size: {self.chunk_size}")
         
         # Process VAD if enabled
         if self.enable_vad and self.vad_manager:
@@ -351,7 +344,7 @@ class AudioStream:
                     logger.info("Speech detected - started")
                 elif self.vad_manager.has_speech_ended():
                     duration = self.vad_manager.get_speech_duration()
-                    logger.info(f"Speech ended - duration: {duration:.2f}s")
+                    logger.debug(f"Speech ended - duration: {duration:.2f}s")
                     
             except Exception as e:
                 logger.error(f"Error in VAD processing: {e}")
@@ -359,10 +352,6 @@ class AudioStream:
         # Process hotword detection if enabled
         if self.enable_hotword and self.hotword_detector:
             try:
-                # DEBUG: Log what we're sending to hotword detector
-                if hasattr(self, '_callback_debug_counter') and self._callback_debug_counter <= 3:
-                    logger.info(f"[audio_utils.py:364] Sending to hotword_detector.process_audio_chunk() - size: {len(audio_data)}")
-                
                 # Pass the audio data to hotword detector (it handles buffering internally)
                 hotword_detected = self.hotword_detector.process_audio_chunk(audio_data)
                 
@@ -370,16 +359,7 @@ class AudioStream:
                     logger.info("Hotword detected!")
                         
             except Exception as e:
-                error_msg = str(e)
-                # COMPREHENSIVE ERROR DEBUGGING
-                logger.error(f"[audio_utils.py:377] ERROR in hotword processing - File: audio_utils.py, Line: 377, Error: {error_msg}")
-                logger.error(f"[audio_utils.py:378] Context - audio_data size: {len(audio_data)}, chunk_size: {self.chunk_size}")
-                logger.error(f"[audio_utils.py:379] Full exception details: {type(e).__name__}: {e}")
-                
-                if "Invalid frame length" in error_msg:
-                    logger.error(f"[audio_utils.py:381] FRAME LENGTH ERROR - This should be handled by conversion function!")
-                else:
-                    logger.error(f"[audio_utils.py:384] Other error in hotword processing: {e}")
+                logger.error(f"Error in hotword processing: {e}")
         
         # Call user callback with audio data (copy to prevent memory retention)
         try:
@@ -401,7 +381,6 @@ class AudioStream:
             return
         
         logger.info("Starting audio stream...")
-        logger.info(f"[audio_utils.py:406] Stream config - device: {self.device}, channels: {self.channels}, sample_rate: {self.sample_rate}, blocksize: {self.chunk_size}")
         
         try:
             self.stream = sd.InputStream(
@@ -412,7 +391,6 @@ class AudioStream:
                 dtype=DTYPE,
                 callback=self._audio_callback
             )
-            logger.info(f"[audio_utils.py:415] Stream created successfully with blocksize: {self.chunk_size}")
             
             self.stream.start()
             self.is_running = True

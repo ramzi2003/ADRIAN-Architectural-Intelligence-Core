@@ -33,7 +33,6 @@ from services.io_service.conversation_manager import ConversationManager, Conver
 from services.io_service.stt_utils import STTProcessor, AudioQuality, STTError, get_stt_processor
 from services.io_service.personality_error_handler import PersonalityErrorHandler, get_personality_handler
 from services.io_service.vad_utils import VADState
-from services.io_service.tts_utils import TTSProcessor, TTSConfig
 
 # Setup logging
 logger = setup_logging("io-service")
@@ -44,11 +43,15 @@ audio_stream: Optional[AudioStream] = None
 conversation_manager: Optional[ConversationManager] = None
 stt_processor: Optional[STTProcessor] = None
 personality_handler: Optional[PersonalityErrorHandler] = None
-tts_processor: Optional[TTSProcessor] = None
 main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # Flag to prevent duplicate STT processing
 _stt_processing_lock = False
+
+# Flag to prevent microphone feedback loop (pause VAD when ADRIAN is speaking, but keep hotword active)
+_listening_for_responses = False
+_mic_paused_for_tts = False
+_tts_is_playing = False  # Track if TTS is currently playing
 
 
 # Request models
@@ -84,8 +87,55 @@ def signal_handler(sig, frame):
 
 def on_hotword_detected():
     """Called when 'ADRIAN' hotword is detected."""
+    global _tts_is_playing
+    
     try:
+        # Check if TTS is currently playing - if so, interrupt it
+        if _tts_is_playing:
+            logger.info("🛑 Hotword detected during TTS - interrupting ADRIAN...")
+            print("\n" + "="*60)
+            print("🛑 INTERRUPTING ADRIAN - Hotword detected!")
+            print("="*60 + "\n")
+            
+            # Interrupt TTS by calling Output Service API
+            asyncio.run_coroutine_threadsafe(_interrupt_tts(), main_event_loop)
+            
+            # Resume microphone immediately
+            if audio_stream and _mic_paused_for_tts:
+                audio_stream.resume()
+                _mic_paused_for_tts = False
+                _tts_is_playing = False
+            
+            return
+        
+        # Normal hotword detection (when TTS is not playing)
+        print("\n" + "="*60)
+        print("🎯 ADRIAN HOTWORD DETECTED! Listening...")
+        print("="*60 + "\n")
+        
         logger.info("🎯 ADRIAN hotword detected! Starting conversation...")
+        
+        # Play a beep sound for feedback
+        try:
+            import platform
+            if platform.system() == "Windows":
+                # Windows beep
+                import winsound
+                winsound.Beep(800, 200)  # 800 Hz for 200ms
+            else:
+                # Linux/WSL beep using system beep
+                import os
+                os.system('echo -e "\a"')  # Terminal bell
+                # Try to play a sound file if available
+                try:
+                    import subprocess
+                    # Try to play a simple beep
+                    subprocess.run(['paplay', '/usr/share/sounds/freedesktop/stereo/bell.oga'], 
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
+                except:
+                    pass
+        except Exception as e:
+            logger.debug(f"Could not play beep: {e}")
         
         # Start conversation in conversation manager
         if conversation_manager:
@@ -134,6 +184,8 @@ async def _process_speech_segment():
         if not conversation_manager or not conversation_manager.is_in_conversation():
             return
         
+        print("\n🎤 Processing speech...\n")
+        
         # Update state to processing
         conversation_manager.current_state = ConversationState.PROCESSING
         
@@ -141,6 +193,9 @@ async def _process_speech_segment():
         transcription, confidence, is_valid = await conversation_manager.process_audio_buffer()
         
         if is_valid and transcription:
+            print(f"💬 You said: '{transcription}' (confidence: {confidence:.2f})")
+            print("🤖 Waiting for ADRIAN's response...\n")
+            
             # Publish UtteranceEvent to Redis
             await _publish_utterance(transcription, confidence, conversation_manager.current_context)
             
@@ -237,45 +292,96 @@ def on_audio_chunk(audio_data):
 
 
 # =============================================================================
-# TTS Response Handler
+# Echo Prevention: Pause microphone when ADRIAN is speaking
 # =============================================================================
 
-async def _handle_response_messages():
-    """Subscribe to Redis responses channel and speak them via TTS."""
+async def _interrupt_tts():
+    """Interrupt TTS playback by calling Output Service API."""
     try:
-        redis_client = await get_redis_client()
+        import httpx
+        from shared.config import get_settings
+        settings = get_settings()
         
-        logger.info("🔊 Starting TTS response handler...")
-        
-        # Import ResponseText schema
-        from shared.schemas import ResponseText
-        
-        # Define message handler
-        async def handle_response(message_data):
-            try:
-                # Parse response
-                if isinstance(message_data, dict):
-                    response = ResponseText(**message_data)
-                else:
-                    response = message_data
-                
-                # Check if we should speak this response
-                if response.should_speak and tts_processor:
-                    logger.info(f"🗣️ Speaking: '{response.text[:50]}...'")
-                    
-                    # Speak the response (non-blocking, queued)
-                    tts_processor.speak(response.text, blocking=False)
-                else:
-                    logger.debug(f"Skipping TTS for: '{response.text[:50]}...'")
-                    
-            except Exception as e:
-                logger.error(f"Error processing response message: {e}")
-        
-        # Subscribe to responses channel
-        await redis_client.subscribe("responses", handle_response)
-        
+        # Call Output Service to stop TTS
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                f"http://127.0.0.1:{settings.output_service_port}/tts/stop",
+                json={}
+            )
+            if response.status_code == 200:
+                logger.info("✅ TTS interrupted successfully")
+            else:
+                logger.warning(f"Failed to interrupt TTS: {response.status_code}")
     except Exception as e:
-        logger.error(f"TTS response handler error: {e}")
+        logger.error(f"Error interrupting TTS: {e}")
+        # Fallback: try to stop playback directly via stop_playback
+        # This requires access to TTS processor, which we don't have in IO Service
+        # So we rely on the API call
+
+
+async def _handle_response_messages():
+    """
+    Subscribe to 'responses' channel to know when ADRIAN is speaking.
+    Pause VAD/callback during TTS (but keep hotword active for interruption).
+    """
+    global audio_stream, _mic_paused_for_tts, _tts_is_playing
+    
+    logger.info("Starting response listener for echo prevention (hotword interruption enabled)...")
+    redis_client = await get_redis_client()
+    
+    async def handle_response(data: dict):
+        """Handle incoming response - pause VAD during TTS, but keep hotword active."""
+        global audio_stream, _mic_paused_for_tts, _tts_is_playing
+        
+        try:
+            from shared.schemas import ResponseText
+            response = ResponseText(**data)
+            
+            # Only pause if response should be spoken
+            if response.should_speak and audio_stream and audio_stream.is_running:
+                # Estimate TTS duration (average ~150 words/min = ~2.5 words/sec)
+                # Add buffer for safety
+                word_count = len(response.text.split())
+                estimated_duration = (word_count / 2.5) + 0.5  # seconds
+                
+                logger.info(f"🔇 Pausing VAD for {estimated_duration:.1f}s (TTS: '{response.text[:50]}...')")
+                logger.info("   💡 Hotword detection still active - say 'ADRIAN' to interrupt!")
+                print(f"\n[ECHO PREVENTION] Pausing normal speech recognition...")
+                print(f"   Say 'ADRIAN' to interrupt if needed!\n")
+                
+                # Mark TTS as playing and pause VAD/callback (but keep hotword active)
+                _mic_paused_for_tts = True
+                _tts_is_playing = True
+                audio_stream.pause()  # Pause VAD and callback (hotword still active)
+                
+                # Resume after estimated duration + buffer
+                await asyncio.sleep(estimated_duration + 0.5)  # Extra 0.5s buffer
+                
+                if audio_stream and _tts_is_playing:  # Only resume if not interrupted
+                    audio_stream.resume()  # Resume listening
+                    logger.info("✅ VAD resumed after TTS")
+                    print("[ECHO PREVENTION] Normal speech recognition resumed\n")
+                
+                _mic_paused_for_tts = False
+                _tts_is_playing = False
+                
+        except Exception as e:
+            logger.error(f"Error handling response for echo prevention: {e}")
+            # Resume microphone on error
+            if audio_stream and _mic_paused_for_tts:
+                audio_stream.resume()
+                _mic_paused_for_tts = False
+                _tts_is_playing = False
+    
+    # Subscribe to responses channel
+    await redis_client.subscribe("responses", handle_response)
+
+
+# =============================================================================
+# TTS is handled by Output Service, not IO Service
+# IO Service is input-only (microphone, STT, hotword detection)
+# All responses are published to Redis and handled by Output Service
+#
 
 
 # =============================================================================
@@ -285,7 +391,7 @@ async def _handle_response_messages():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    global audio_stream, conversation_manager, stt_processor, personality_handler, tts_processor, main_event_loop
+    global audio_stream, conversation_manager, stt_processor, personality_handler, main_event_loop, _listening_for_responses
     
     # Store the main event loop for callbacks
     main_event_loop = asyncio.get_event_loop()
@@ -296,10 +402,15 @@ async def lifespan(app: FastAPI):
     redis_client = await get_redis_client()
     logger.info("✅ Connected to Redis")
     
+    # Start listening for responses (to pause mic during TTS)
+    _listening_for_responses = True
+    asyncio.create_task(_handle_response_messages())
+    logger.info("✅ Response listener started (echo prevention enabled)")
+    
     # Initialize STT processor with configuration
     try:
         logger.info(f"Initializing Whisper STT processor (model: {settings.whisper_model_name}, device: {settings.whisper_device})...")
-        from .stt_utils import STTProcessor
+        # Use absolute import (already imported at top)
         stt_processor = STTProcessor(
             model_name=settings.whisper_model_name,
             device=settings.whisper_device
@@ -322,26 +433,8 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize personality handler: {e}")
         personality_handler = None
     
-    # Initialize TTS processor with configuration
-    try:
-        logger.info(f"Initializing TTS processor (model: {settings.tts_model_name}, voice cloning: {settings.tts_use_voice_cloning}, speed: {settings.tts_speed}, pitch: {settings.tts_pitch_shift})...")
-        tts_config = TTSConfig(
-            model_name=settings.tts_model_name,
-            speaker=settings.tts_speaker,
-            use_voice_cloning=getattr(settings, 'tts_use_voice_cloning', False),
-            speed=settings.tts_speed,
-            pitch_shift=settings.tts_pitch_shift,
-            device=settings.tts_device
-        )
-        tts_processor = TTSProcessor(config=tts_config)
-        if tts_processor.load_model():
-            logger.info("✅ TTS model loaded successfully")
-        else:
-            logger.error("❌ Failed to load TTS model")
-            tts_processor = None
-    except Exception as e:
-        logger.error(f"Failed to initialize TTS processor: {e}")
-        tts_processor = None
+    # TTS is handled by Output Service, not IO Service
+    # IO Service only handles input (microphone, STT, hotword detection)
     
     # Initialize conversation manager with configuration
     try:
@@ -373,36 +466,24 @@ async def lifespan(app: FastAPI):
         # Auto-start audio stream for continuous listening
         audio_stream.start()
         logger.info("✅ Audio stream started - listening for 'ADRIAN'...")
+        print("\n" + "="*60)
+        print("✅ IO Service ready - Say 'ADRIAN' to start!")
+        print("="*60 + "\n")
         
     except Exception as e:
         logger.error(f"Failed to initialize audio stream: {e}")
         audio_stream = None
     
-    # Start TTS response handler in background
-    tts_task = None
-    if tts_processor:
-        tts_task = asyncio.create_task(_handle_response_messages())
-        logger.info("✅ TTS response handler started")
-    
     logger.info("🎉 IO Service startup complete - ready for voice input!")
+    logger.info("📢 Note: TTS output is handled by Output Service (port 8006)")
     
     yield
     
     # Shutdown
     logger.info("🛑 Shutting down IO Service...")
     
-    # Cancel TTS response handler
-    if tts_task:
-        tts_task.cancel()
-        try:
-            await tts_task
-        except asyncio.CancelledError:
-            pass
-    
-    # Stop TTS processor
-    if tts_processor:
-        tts_processor.shutdown()
-        logger.info("TTS processor stopped")
+    # Stop listening for responses (already declared global at function start)
+    _listening_for_responses = False
     
     # Stop audio stream
     if audio_stream:
@@ -436,7 +517,6 @@ async def health_check():
         hotword_status = "enabled" if status.get("is_running", False) else "stopped"
     
     stt_status = "loaded" if (stt_processor and stt_processor.is_model_loaded) else "not_loaded"
-    tts_status = "loaded" if (tts_processor and tts_processor.is_model_loaded) else "not_loaded"
     conversation_status = "active" if (conversation_manager and conversation_manager.is_in_conversation()) else "idle"
     
     return HealthResponse(
@@ -445,7 +525,6 @@ async def health_check():
         dependencies={
             "redis": "connected",
             "stt_engine": stt_status,
-            "tts_engine": tts_status,
             "microphone": "available" if audio_stream else "unavailable",
             "hotword_detection": hotword_status,
             "conversation_manager": conversation_status,
@@ -665,37 +744,8 @@ async def get_stt_status():
         }
 
 
-@app.get("/status/tts")
-async def get_tts_status():
-    """
-    Get TTS processor status and performance metrics.
-    """
-    global tts_processor
-    
-    try:
-        if tts_processor is None:
-            return {
-                "status": "not_initialized",
-                "message": "TTS processor not initialized"
-            }
-        
-        # Get performance stats
-        stats = tts_processor.get_performance_stats()
-        
-        return {
-            "status": "ok",
-            "model_loaded": tts_processor.is_model_loaded,
-            "model_name": tts_processor.config.model_name,
-            "speed": tts_processor.config.speed,
-            "performance_stats": stats
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting TTS status: {e}")
-        return {
-            "status": "error",
-            "message": f"Error getting status: {str(e)}"
-        }
+# TTS status endpoint removed - TTS is handled by Output Service
+# Use GET /tts/status on Output Service (port 8006) instead
 
 
 

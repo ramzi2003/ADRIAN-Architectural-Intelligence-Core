@@ -263,6 +263,8 @@ class AudioStream:
         self.chunk_size = chunk_size
         self.stream = None
         self.is_running = False
+        self.is_paused = False  # Flag for temporarily pausing VAD/callback (but keep hotword active)
+        self.keep_hotword_active = True  # Keep hotword detection active even when paused
         
         # VAD support
         self.enable_vad = enable_vad and VADStateManager is not None
@@ -304,6 +306,31 @@ class AudioStream:
     
     def _audio_callback(self, indata, frames, time_info, status):
         """Internal callback for sounddevice stream with VAD processing."""
+        # Get audio data as mono numpy array (always needed for hotword detection)
+        audio_data = indata.copy()
+        
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data[:, 0]  # Take first channel if stereo
+        
+        # Convert to int16 for processing
+        if audio_data.dtype != np.int16:
+            # Convert from float to int16
+            max_val = np.iinfo(np.int16).max
+            audio_data = (audio_data * max_val).astype(np.int16)
+        
+        # ALWAYS process hotword detection (even when paused) - allows interruption
+        if self.enable_hotword and self.hotword_detector:
+            try:
+                hotword_detected = self.hotword_detector.process_audio_chunk(audio_data)
+                if hotword_detected:
+                    logger.info("Hotword detected! (even during TTS pause)")
+            except Exception as e:
+                logger.error(f"Error in hotword processing: {e}")
+        
+        # Skip VAD and callback if paused (to prevent feedback loop)
+        if self.is_paused:
+            return
+        
         # Only log warnings/errors, not every callback
         if status and status.input_overflow:
             # Input overflow is common and not critical - log at debug level only occasionally
@@ -315,19 +342,7 @@ class AudioStream:
         elif status:
             logger.warning(f"Audio stream status: {status}")
         
-        # Get audio data as mono numpy array
-        audio_data = indata.copy()
-        
-        if len(audio_data.shape) > 1:
-            audio_data = audio_data[:, 0]  # Take first channel if stereo
-        
-        # Convert to int16 for VAD processing
-        if audio_data.dtype != np.int16:
-            # Convert from float to int16
-            max_val = np.iinfo(np.int16).max
-            audio_data = (audio_data * max_val).astype(np.int16)
-        
-        # Process VAD if enabled
+        # Process VAD if enabled (only when not paused)
         if self.enable_vad and self.vad_manager:
             try:
                 is_speech, vad_state = self.vad_manager.process_chunk(audio_data)
@@ -348,18 +363,6 @@ class AudioStream:
                     
             except Exception as e:
                 logger.error(f"Error in VAD processing: {e}")
-        
-        # Process hotword detection if enabled
-        if self.enable_hotword and self.hotword_detector:
-            try:
-                # Pass the audio data to hotword detector (it handles buffering internally)
-                hotword_detected = self.hotword_detector.process_audio_chunk(audio_data)
-                
-                if hotword_detected:
-                    logger.info("Hotword detected!")
-                        
-            except Exception as e:
-                logger.error(f"Error in hotword processing: {e}")
         
         # Call user callback with audio data (copy to prevent memory retention)
         try:
@@ -405,8 +408,23 @@ class AudioStream:
                 logger.info("Audio stream started")
             
         except Exception as e:
-            logger.error(f"Failed to start audio stream: {e}")
-            raise
+            error_msg = str(e)
+            if "Error querying device" in error_msg or "device -1" in error_msg:
+                # WSL/audio driver issue - provide helpful message
+                logger.error(f"Failed to start audio stream: {e}")
+                logger.error("⚠️  Audio device not accessible - common in WSL (Windows Subsystem for Linux)")
+                logger.error("   Solutions:")
+                logger.error("   1. Run IO Service in Windows PowerShell (recommended)")
+                logger.error("   2. Use text input API: POST /input/text")
+                logger.error("   3. Set up PulseAudio for WSL (complex)")
+                raise RuntimeError(
+                    "Audio device not accessible. "
+                    "WSL cannot directly access Windows microphones. "
+                    "Run IO Service in Windows PowerShell or use text input API."
+                ) from e
+            else:
+                logger.error(f"Failed to start audio stream: {e}")
+                raise
     
     def stop(self):
         """Stop the audio stream."""
@@ -426,6 +444,20 @@ class AudioStream:
         
         self.is_running = False
         logger.info("Audio stream stopped")
+    
+    def pause(self):
+        """Pause VAD and callback processing (but keep hotword detection active for interruption)."""
+        if not self.is_running:
+            return
+        self.is_paused = True
+        logger.info("VAD/callback paused (hotword detection still active for interruption)")
+    
+    def resume(self):
+        """Resume VAD and callback processing after pause."""
+        if not self.is_running:
+            return
+        self.is_paused = False
+        logger.info("VAD/callback resumed (normal listening mode)")
     
     def __enter__(self):
         """Context manager entry."""

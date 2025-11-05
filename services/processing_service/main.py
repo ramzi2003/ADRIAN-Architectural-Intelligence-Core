@@ -2,6 +2,13 @@
 Processing Service - NLP and Reasoning Layer
 Handles intent classification, LLM interaction, and personality injection.
 """
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 import asyncio
 import uuid
 import httpx
@@ -49,6 +56,10 @@ async def lifespan(app: FastAPI):
     # Start background listener for utterances
     _listening = True
     asyncio.create_task(listen_for_utterances())
+    
+    print("\n" + "="*60)
+    print("✅ Processing Service ready - Listening for utterances...")
+    print("="*60 + "\n")
     
     # TODO: Initialize connection to Ollama
     # TODO: Initialize Gemini client (optional)
@@ -234,8 +245,18 @@ async def generate_response(text: str, intent: str, context: dict) -> str:
         response = await call_ollama(text, context)
         return response
     except Exception as e:
-        logger.warning(f"Ollama call failed: {e}, falling back to stub")
-        return f"Understood. Processing your request about: {text}"
+        logger.warning(f"Ollama call failed: {e}, falling back to echo response")
+        # Echo response for testing - confirms it heard you correctly
+        text_lower = text.lower()
+        if "hello" in text_lower or "hi" in text_lower:
+            return "Hello, Sir. How may I assist you?"
+        elif "how are you" in text_lower:
+            return "I'm functioning perfectly, Sir. Thank you for asking."
+        elif "what" in text_lower and "time" in text_lower:
+            from datetime import datetime
+            return f"The current time is {datetime.now().strftime('%I:%M %p')}, Sir."
+        else:
+            return f"I heard you say: {text}. At your service, Sir."
 
 
 async def apply_personality(response: str, intent: str) -> str:
@@ -245,11 +266,9 @@ async def apply_personality(response: str, intent: str) -> str:
     """
     logger.info("[STUB] Applying personality layer")
     
-    # Simple prefix for now
-    if intent == "conversation":
-        return f"Sir, {response}"
-    else:
-        return f"At once, Sir. {response}"
+    # Response already has personality, just return it
+    # (Avoid double-prefixing since generate_response already adds it)
+    return response
 
 
 async def call_ollama(prompt: str, context: dict) -> str:

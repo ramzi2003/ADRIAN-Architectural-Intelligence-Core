@@ -2,6 +2,14 @@
 Conversation Manager for ADRIAN IO Service.
 Handles conversation state, context awareness, and continuous listening.
 """
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import asyncio
 import time
 import numpy as np
@@ -11,8 +19,8 @@ from dataclasses import dataclass
 from collections import deque
 
 from shared.logging_config import get_logger
-from .stt_utils import STTProcessor, AudioQuality, STTError, speech_to_text
-from .vad_utils import VADState
+from services.io_service.stt_utils import STTProcessor, AudioQuality, STTError, speech_to_text
+from services.io_service.vad_utils import VADState
 
 logger = get_logger("io-service.conversation")
 

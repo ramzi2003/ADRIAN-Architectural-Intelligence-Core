@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     tts_speed: float = 1.0  # Normal pace for clarity
     tts_pitch_shift: float = -2.5  # Deeper, authoritative tone
     tts_device: str = "cpu"  # "cpu" or "cuda"
+    tts_volume: float = 1.0  # Volume level (0.0 to 1.0)
+    tts_enabled: bool = True  # Enable/disable TTS output
     
     # Service Ports
     io_service_port: int = 8001

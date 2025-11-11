@@ -18,6 +18,7 @@ class MessageType(str, Enum):
     MEMORY_RESULT = "memory_result"
     SECURITY_CHECK = "security_check"
     SECURITY_RESULT = "security_result"
+    TTS_EVENT = "tts_event"
 
 
 class BaseMessage(BaseModel):
@@ -92,6 +93,17 @@ class SecurityResult(BaseMessage):
     check_id: str
     approved: bool
     reason: Optional[str] = None
+
+
+class TTSPlaybackEvent(BaseMessage):
+    """Event emitted by output-service when TTS playback starts/ends."""
+
+    message_type: MessageType = MessageType.TTS_EVENT
+    event: str = Field(..., description="'start', 'end', or 'error'")
+    conversation_id: Optional[str] = Field(None, description="Conversation correlation ID")
+    text: Optional[str] = Field(None, description="Text associated with playback")
+    duration_ms: Optional[float] = Field(None, description="Playback duration in milliseconds")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 # Health check response

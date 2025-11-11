@@ -4,8 +4,11 @@ Handles text-to-speech, visual output, and system notifications.
 """
 import asyncio
 import sys
+import uuid
+from collections import deque
+from typing import Optional, Deque
 from pathlib import Path
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -15,17 +18,25 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from shared.config import get_settings
-from shared.schemas import ResponseText, ActionResult, HealthResponse
-from shared.redis_client import get_redis_client
+from shared.schemas import ResponseText, ActionResult, HealthResponse, TTSPlaybackEvent
+from shared.redis_client import get_redis_client, RedisClient
 from shared.logging_config import setup_logging
 from shared.tts_processor import TTSProcessor, TTSConfig
+from services.output_service.tray_indicator import TrayIndicator
 
 # Setup logging
 logger = setup_logging("output-service")
 settings = get_settings()
 
-# Global TTS processor
+# Global state
 tts_processor: TTSProcessor = None
+redis_client: Optional[RedisClient] = None
+playback_event_queue: Optional[asyncio.Queue] = None
+playback_event_task: Optional[asyncio.Task] = None
+pending_playback: Deque[dict] = deque()
+current_playback: Optional[dict] = None
+tray_indicator: Optional[TrayIndicator] = None
+main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 # Request models
@@ -45,6 +56,17 @@ class ToggleRequest(BaseModel):
     enabled: bool
 
 
+class VoiceRequest(BaseModel):
+    """Request to change active TTS voice."""
+    speaker: str
+
+
+class OutputDeviceRequest(BaseModel):
+    """Request to change output audio device."""
+    index: Optional[int] = None
+    name: Optional[str] = None
+
+
 # Background task flags
 _listening_responses = False
 _listening_results = False
@@ -54,12 +76,21 @@ _listening_results = False
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    global _listening_responses, _listening_results, tts_processor
+    global _listening_responses, _listening_results, tts_processor, redis_client
+    global playback_event_queue, playback_event_task, tray_indicator, main_event_loop
     logger.info("Starting Output Service...")
     
     # Connect to Redis
     redis_client = await get_redis_client()
     logger.info("Connected to Redis")
+    main_event_loop = asyncio.get_event_loop()
+    playback_event_queue = asyncio.Queue()
+    if settings.tray_indicator_enabled:
+        tray_indicator_local = TrayIndicator()
+        tray_indicator_local.start()
+        tray_indicator = tray_indicator_local
+        if tray_indicator:
+            tray_indicator.set_state("idle")
     
     # Initialize TTS processor
     await initialize_tts()
@@ -69,6 +100,7 @@ async def lifespan(app: FastAPI):
     _listening_results = True
     asyncio.create_task(listen_for_responses())
     asyncio.create_task(listen_for_action_results())
+    playback_event_task = asyncio.create_task(process_playback_events())
     
     print("\n" + "="*60)
     print("✅ Output Service ready - TTS enabled!")
@@ -80,12 +112,20 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down Output Service...")
     _listening_responses = False
     _listening_results = False
+    if playback_event_task:
+        playback_event_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await playback_event_task
     
     # Shutdown TTS processor
     if tts_processor:
         tts_processor.shutdown()
     
-    await redis_client.disconnect()
+    if tray_indicator:
+        tray_indicator.set_state("idle")
+        tray_indicator.stop()
+    if redis_client:
+        await redis_client.disconnect()
 
 
 # Create FastAPI app
@@ -185,6 +225,68 @@ async def toggle_tts(request: ToggleRequest):
     return {"status": "success", "enabled": request.enabled}
 
 
+@app.post("/tts/voice")
+async def set_voice(request: VoiceRequest):
+    """Change the active speaker voice."""
+    global tts_processor
+
+    if not tts_processor:
+        raise HTTPException(status_code=503, detail="TTS processor not initialized")
+
+    available = tts_processor.list_available_voices()
+    if available and request.speaker not in available:
+        raise HTTPException(status_code=400, detail=f"Speaker '{request.speaker}' not available")
+
+    tts_processor.set_voice(request.speaker)
+    return {"status": "success", "speaker": request.speaker}
+
+
+@app.get("/tts/voices")
+async def list_voices():
+    """List available TTS voices."""
+    global tts_processor
+
+    if not tts_processor:
+        raise HTTPException(status_code=503, detail="TTS processor not initialized")
+
+    return {"voices": tts_processor.list_available_voices()}
+
+
+@app.post("/tts/output-device")
+async def set_output_device(request: OutputDeviceRequest):
+    """Update the audio output device by name or index."""
+    global tts_processor
+
+    if not tts_processor:
+        raise HTTPException(status_code=503, detail="TTS processor not initialized")
+
+    if request.index is None and not request.name:
+        raise HTTPException(status_code=400, detail="Provide either 'index' or 'name'")
+
+    tts_processor.set_output_device(index=request.index, name=request.name)
+    stats = tts_processor.get_performance_stats()
+    return {
+        "status": "success",
+        "output_device_index": stats.get("output_device_index"),
+        "hint": "Restart playback for changes to take effect"
+    }
+
+
+@app.get("/tts/output-device")
+async def get_output_device():
+    """Return current output device configuration."""
+    global tts_processor
+
+    if not tts_processor:
+        raise HTTPException(status_code=503, detail="TTS processor not initialized")
+
+    stats = tts_processor.get_performance_stats()
+    return {
+        "output_device_index": stats.get("output_device_index"),
+        "available_voices": tts_processor.list_available_voices()
+    }
+
+
 @app.get("/tts/status")
 async def get_tts_status():
     """Get TTS status and statistics."""
@@ -227,7 +329,7 @@ async def listen_for_responses():
     global tts_processor
     
     logger.info("Started listening for responses...")
-    redis_client = await get_redis_client()
+    redis_client_local = await get_redis_client()
     
     async def handle_response(data: dict):
         """Process incoming response text."""
@@ -245,16 +347,28 @@ async def listen_for_responses():
             # Speak if requested
             if response.should_speak and tts_processor:
                 print("🔊 Speaking now...\n")
+                pending_payload = {
+                    "correlation_id": response.correlation_id,
+                    "text": response.text
+                }
+                pending_playback.append(pending_payload)
+                if tray_indicator:
+                    tray_indicator.set_state("speaking")
                 # Queue for async playback
-                tts_processor.speak(response.text, blocking=False, interrupt=False)
+                if not tts_processor.speak(response.text, blocking=False, interrupt=False):
+                    # Remove pending payload if queueing failed
+                    if pending_playback and pending_playback[-1] == pending_payload:
+                        pending_playback.pop()
             else:
                 print("\n")
+                if tray_indicator:
+                    tray_indicator.set_state("idle")
             
         except Exception as e:
             logger.error(f"Error handling response: {e}")
     
     # Subscribe and listen
-    await redis_client.subscribe("responses", handle_response)
+    await redis_client_local.subscribe("responses", handle_response)
 
 
 async def listen_for_action_results():
@@ -262,7 +376,7 @@ async def listen_for_action_results():
     Background task that listens to action_result events from Redis.
     """
     logger.info("Started listening for action results...")
-    redis_client = await get_redis_client()
+    redis_client_local = await get_redis_client()
     
     async def handle_action_result(data: dict):
         """Process incoming action result."""
@@ -280,7 +394,77 @@ async def listen_for_action_results():
             logger.error(f"Error handling action result: {e}")
     
     # Subscribe and listen
-    await redis_client.subscribe("action_results", handle_action_result)
+    await redis_client_local.subscribe("action_results", handle_action_result)
+
+
+def _enqueue_playback_event(event: str, payload: dict):
+    if playback_event_queue is None or main_event_loop is None:
+        return
+    try:
+        main_event_loop.call_soon_threadsafe(playback_event_queue.put_nowait, (event, payload))
+    except RuntimeError as exc:
+        logger.debug(f"Failed to enqueue playback event: {exc}")
+
+
+def playback_event_handler(event: str, payload: dict):
+    """Handle playback events from TTS processor (executed in worker thread)."""
+    global current_playback, pending_playback
+
+    combined = dict(payload)
+
+    if event == "start":
+        metadata = pending_playback.popleft() if pending_playback else {}
+        current_playback = metadata or None
+        combined = {**metadata, **payload}
+    elif event in {"end", "error", "interrupted"}:
+        metadata = current_playback or {}
+        combined = {**metadata, **payload}
+        if event in {"end", "interrupted", "error"}:
+            current_playback = None
+
+    _enqueue_playback_event(event, combined)
+
+
+async def process_playback_events():
+    """Publish playback events to Redis and update tray indicator."""
+    while True:
+        try:
+            if playback_event_queue is None:
+                await asyncio.sleep(0.1)
+                continue
+
+            event, payload = await playback_event_queue.get()
+            try:
+                correlation_id = payload.get("correlation_id") or str(uuid.uuid4())
+                message = TTSPlaybackEvent(
+                    message_id=str(uuid.uuid4()),
+                    correlation_id=correlation_id,
+                    event=event,
+                    conversation_id=payload.get("correlation_id"),
+                    text=payload.get("text"),
+                    duration_ms=payload.get("duration_ms"),
+                    metadata={k: v for k, v in payload.items() if k not in {"text", "duration_ms", "correlation_id"}}
+                )
+                if redis_client:
+                    await redis_client.publish("tts_events", message)
+
+                if tray_indicator:
+                    if event == "start":
+                        tray_indicator.set_state("speaking")
+                    elif event == "end":
+                        tray_indicator.set_state("idle")
+                    elif event == "error":
+                        tray_indicator.set_state("error")
+                    elif event == "interrupted":
+                        tray_indicator.set_state("idle")
+            finally:
+                if playback_event_queue:
+                    playback_event_queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(f"Playback event processing error: {exc}")
+            await asyncio.sleep(0.1)
 
 
 async def initialize_tts():
@@ -300,7 +484,9 @@ async def initialize_tts():
             speed=settings.tts_speed,
             pitch_shift=settings.tts_pitch_shift,
             device=settings.tts_device,
-            volume=settings.tts_volume
+            volume=settings.tts_volume,
+            output_device_index=settings.speaker_device_index,
+            output_device_name=settings.speaker_device_name
         )
         
         # Initialize TTS processor
@@ -312,6 +498,7 @@ async def initialize_tts():
         if success:
             # Set initial enabled state
             tts_processor.set_enabled(settings.tts_enabled)
+            tts_processor.set_playback_event_handler(playback_event_handler)
             logger.info("✅ TTS engine initialized successfully")
         else:
             logger.error("❌ Failed to load TTS model")

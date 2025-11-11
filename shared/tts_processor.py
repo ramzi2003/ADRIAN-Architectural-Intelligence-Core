@@ -7,7 +7,7 @@ import logging
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-from typing import Optional, List
+from typing import Optional, List, Callable, Dict, Any
 from pathlib import Path
 import threading
 import queue
@@ -32,6 +32,8 @@ class TTSConfig:
     sample_rate: int = 22050
     device: str = "cpu"  # "cpu" or "cuda"
     volume: float = 1.0  # Volume multiplier (0.0 to 1.0)
+    output_device_index: Optional[int] = None  # Preferred output device index
+    output_device_name: Optional[str] = None  # Preferred output device name (partial match)
 
 
 class TTSProcessor:
@@ -61,6 +63,10 @@ class TTSProcessor:
         # Current playback lock (for interrupts)
         self._playback_lock = threading.Lock()
         self._current_playback_process = None
+        self._playback_event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self._output_device_index: Optional[int] = None
+        self.last_playback_duration_ms: float = 0.0
+        self.last_playback_started_at: float = 0.0
         
         # Statistics
         self.total_synthesized = 0
@@ -68,6 +74,28 @@ class TTSProcessor:
         self.synthesis_times: List[float] = []
         
         logger.info("TTS Processor initialized")
+        self._resolve_output_device()
+
+    def _resolve_output_device(self):
+        """Resolve preferred output device index based on config settings."""
+        # Explicit index takes priority
+        if self.config.output_device_index is not None:
+            self._output_device_index = self.config.output_device_index
+            logger.info(f"Configured output device index: {self._output_device_index}")
+            return
+
+        if self.config.output_device_name:
+            try:
+                for idx, device in enumerate(sd.query_devices()):
+                    if device.get("max_output_channels", 0) > 0 and self.config.output_device_name.lower() in device.get("name", "").lower():
+                        self._output_device_index = idx
+                        logger.info(f"Matched output device '{device['name']}' (index {idx})")
+                        return
+                logger.warning(f"Output device name '{self.config.output_device_name}' not found; using default")
+            except Exception as exc:
+                logger.warning(f"Unable to query audio devices: {exc}")
+        else:
+            logger.debug("No explicit output device provided; using system default")
     
     def load_model(self) -> bool:
         """
@@ -316,7 +344,11 @@ class TTSProcessor:
             else:
                 # Native playback using sounddevice
                 with self._playback_lock:
-                    sd.play(audio, samplerate=self.config.sample_rate)
+                    sd.play(
+                        audio,
+                        samplerate=self.config.sample_rate,
+                        device=self._output_device_index
+                    )
                     sd.wait()  # Wait until audio finishes playing
             
             self.total_played += 1
@@ -396,9 +428,19 @@ class TTSProcessor:
                 
                 # Synthesize and play
                 self.is_playing = True
+                self.last_playback_started_at = time.perf_counter()
+                self._emit_playback_event("start", {"text": text})
                 audio = self.synthesize_speech(text)
                 if audio is not None:
                     self.play_audio(audio)
+                    self.last_playback_duration_ms = (time.perf_counter() - self.last_playback_started_at) * 1000
+                    self._emit_playback_event(
+                        "end",
+                        {
+                            "text": text,
+                            "duration_ms": round(self.last_playback_duration_ms, 2),
+                        }
+                    )
                 self.is_playing = False
                 
                 self.playback_queue.task_done()
@@ -408,6 +450,7 @@ class TTSProcessor:
             except Exception as e:
                 logger.error(f"Playback worker error: {e}")
                 self.is_playing = False
+                self._emit_playback_event("error", {"error": str(e)})
         
         logger.info("TTS playback worker stopped")
     
@@ -435,6 +478,7 @@ class TTSProcessor:
         
         self.is_playing = False
         logger.info("Audio playback stopped")
+        self._emit_playback_event("interrupted", {})
     
     def set_volume(self, volume: float):
         """
@@ -457,6 +501,42 @@ class TTSProcessor:
         if not enabled:
             self.stop_playback()
         logger.info(f"TTS {'enabled' if enabled else 'disabled'}")
+
+    def set_output_device(self, *, index: Optional[int] = None, name: Optional[str] = None):
+        """Update the preferred output device."""
+        if index is not None:
+            self.config.output_device_index = index
+            self.config.output_device_name = None
+        elif name:
+            self.config.output_device_name = name
+            self.config.output_device_index = None
+        self._resolve_output_device()
+
+    def set_voice(self, speaker_id: str):
+        """Change active speaker voice."""
+        self.config.speaker = speaker_id
+        logger.info(f"TTS speaker set to '{speaker_id}'")
+
+    def list_available_voices(self) -> List[str]:
+        """Return available speaker IDs if supported by model."""
+        try:
+            if self.tts and hasattr(self.tts, "speakers"):
+                return list(self.tts.speakers)
+        except Exception as exc:
+            logger.warning(f"Failed to list voices: {exc}")
+        return []
+
+    def set_playback_event_handler(self, handler: Optional[Callable[[str, Dict[str, Any]], None]]):
+        """Register callback for playback events."""
+        self._playback_event_handler = handler
+
+    def _emit_playback_event(self, event: str, payload: Dict[str, Any]):
+        if not self._playback_event_handler:
+            return
+        try:
+            self._playback_event_handler(event, payload)
+        except Exception as exc:
+            logger.debug(f"Playback event handler error: {exc}")
     
     def shutdown(self):
         """Shutdown TTS processor and cleanup resources."""
@@ -499,6 +579,8 @@ class TTSProcessor:
             "queue_size": self.playback_queue.qsize(),
             "is_playing": self.is_playing,
             "speed": self.config.speed,
-            "sample_rate": self.config.sample_rate
+            "sample_rate": self.config.sample_rate,
+            "output_device_index": self._output_device_index,
+            "last_playback_duration_ms": round(self.last_playback_duration_ms, 2),
         }
 

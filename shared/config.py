@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # Porcupine (Hotword Detection)
     picovoice_access_key: Optional[str] = None
     hotword_sensitivity: float = 0.7  # 0.1-1.0
+    activation_beep_enabled: bool = True
+    activation_beep_frequency: int = 800  # Hz
+    activation_beep_duration_ms: int = 180
+    error_beep_enabled: bool = True
+    error_beep_frequency: int = 500  # Hz
+    error_beep_duration_ms: int = 240
     
     # Speech-to-Text (Whisper)
     whisper_model_name: str = "base"  # "tiny", "base", "small", "medium", "large"
@@ -53,6 +59,8 @@ class Settings(BaseSettings):
     
     # Voice Activity Detection (VAD)
     vad_aggressiveness: int = 1  # 0-3 (0=least aggressive, 3=most aggressive)
+    vad_sensitivity_boost: float = 1.0  # Multiplier applied to VAD sensitivity heuristics
+    conversation_retry_limit: int = 2  # Number of retries before apologizing
     
     # Text-to-Speech (Coqui TTS)
     # Using fast VITS model with selected British male voice (p234)
@@ -64,6 +72,8 @@ class Settings(BaseSettings):
     tts_device: str = "cpu"  # "cpu" or "cuda"
     tts_volume: float = 1.0  # Volume level (0.0 to 1.0)
     tts_enabled: bool = True  # Enable/disable TTS output
+    speaker_device_name: Optional[str] = None
+    speaker_device_index: Optional[int] = None
     
     # Service Ports
     io_service_port: int = 8001
@@ -76,6 +86,11 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_db_path: str = "logs/adrian.db"
+    pipeline_metrics_enabled: bool = True
+    pipeline_latency_target_ms: int = 2000
+    tray_indicator_enabled: bool = True
+    microphone_device_name: Optional[str] = None
+    microphone_device_index: Optional[int] = None
     
     # FAISS
     faiss_index_path: str = "data/faiss_index"

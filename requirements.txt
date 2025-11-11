@@ -2,6 +2,7 @@
 # A.D.R.I.A.N - Core Dependencies
 # Autonomous Dreams Rest In Ambitions Naturally
 # ============================================================================
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 # Web Framework
 fastapi>=0.109.0
@@ -26,9 +27,10 @@ numpy>=1.26.0  # Allow newer versions for Python 3.13 compatibility
 httpx>=0.26.0
 
 # Embeddings & NLP
-sentence-transformers>=2.3.1  # For generating embeddings
-torch>=2.1.2  # PyTorch for sentence-transformers
-transformers>=4.37.2
+sentence-transformers==2.2.2  # Stable with torch 2.1 CPU build
+torch==2.1.0+cpu  # Lightweight CPU wheel keeps install fast and compatible
+torchaudio==2.1.0+cpu  # Match torch version for TTS dependencies
+transformers==4.35.0
 
 # Google Gemini API (Cloud LLM)
 google-generativeai>=0.3.2
@@ -37,6 +39,8 @@ google-generativeai>=0.3.2
 sounddevice>=0.4.6  # Microphone capture and playback
 soundfile>=0.12.1  # Audio file I/O (WAV, FLAC, OGG)
 scipy>=1.11.0  # Signal processing for voice effects
+pystray>=0.19.5  # System tray indicator support
+Pillow>=9.5.0  # Required by pystray for icon rendering
 
 # Text-to-Speech (Phase 2 - Active)
 TTS>=0.22.0  # Coqui TTS (high quality, local)

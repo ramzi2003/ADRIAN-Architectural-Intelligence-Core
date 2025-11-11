@@ -7,9 +7,10 @@ import asyncio
 import uuid
 import signal
 import sys
+import time
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict
 from pathlib import Path
 
 # Add project root to path
@@ -20,12 +21,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from shared.config import get_settings
-from shared.schemas import UtteranceEvent, HealthResponse
+from shared.schemas import UtteranceEvent, HealthResponse, TTSPlaybackEvent
 from shared.redis_client import get_redis_client
 from shared.logging_config import setup_logging
 
 # Import audio and hotword utilities
-from services.io_service.audio_utils import AudioStream
+from services.io_service.audio_utils import AudioStream, select_input_device, list_audio_devices
 from services.io_service.hotword_utils import test_hotword_detection
 
 # Import conversation management
@@ -33,6 +34,7 @@ from services.io_service.conversation_manager import ConversationManager, Conver
 from services.io_service.stt_utils import STTProcessor, AudioQuality, STTError, get_stt_processor
 from services.io_service.personality_error_handler import PersonalityErrorHandler, get_personality_handler
 from services.io_service.vad_utils import VADState
+from services.io_service.pipeline_metrics import VoicePipelineMetrics
 
 # Setup logging
 logger = setup_logging("io-service")
@@ -44,6 +46,7 @@ conversation_manager: Optional[ConversationManager] = None
 stt_processor: Optional[STTProcessor] = None
 personality_handler: Optional[PersonalityErrorHandler] = None
 main_event_loop: Optional[asyncio.AbstractEventLoop] = None
+pipeline_metrics: Optional[VoicePipelineMetrics] = None
 
 # Flag to prevent duplicate STT processing
 _stt_processing_lock = False
@@ -52,6 +55,8 @@ _stt_processing_lock = False
 _listening_for_responses = False
 _mic_paused_for_tts = False
 _tts_is_playing = False  # Track if TTS is currently playing
+_last_hotword_timestamp: Optional[float] = None
+_pending_resume_tasks: Dict[str, asyncio.Task] = {}
 
 
 # Request models
@@ -87,7 +92,7 @@ def signal_handler(sig, frame):
 
 def on_hotword_detected():
     """Called when 'ADRIAN' hotword is detected."""
-    global _tts_is_playing
+    global _tts_is_playing, pipeline_metrics, _last_hotword_timestamp
     
     try:
         # Check if TTS is currently playing - if so, interrupt it
@@ -114,32 +119,27 @@ def on_hotword_detected():
         print("="*60 + "\n")
         
         logger.info("🎯 ADRIAN hotword detected! Starting conversation...")
+        _last_hotword_timestamp = time.perf_counter()
         
-        # Play a beep sound for feedback
-        try:
-            import platform
-            if platform.system() == "Windows":
-                # Windows beep
-                import winsound
-                winsound.Beep(800, 200)  # 800 Hz for 200ms
-            else:
-                # Linux/WSL beep using system beep
-                import os
-                os.system('echo -e "\a"')  # Terminal bell
-                # Try to play a sound file if available
-                try:
-                    import subprocess
-                    # Try to play a simple beep
-                    subprocess.run(['paplay', '/usr/share/sounds/freedesktop/stereo/bell.oga'], 
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
-                except:
-                    pass
-        except Exception as e:
-            logger.debug(f"Could not play beep: {e}")
+        # Play a beep sound for feedback (configurable)
+        if settings.activation_beep_enabled:
+            try:
+                import platform
+                if platform.system() == "Windows":
+                    import winsound
+                    winsound.Beep(settings.activation_beep_frequency, settings.activation_beep_duration_ms)
+                else:
+                    import os
+                    os.system('echo -e "\a"')
+            except Exception as e:
+                logger.debug(f"Could not play activation beep: {e}")
         
         # Start conversation in conversation manager
         if conversation_manager:
-            conversation_manager.start_conversation()
+            start_ts = time.time()
+            conversation_id = conversation_manager.start_conversation(hotword_timestamp=start_ts)
+            if pipeline_metrics and settings.pipeline_metrics_enabled:
+                pipeline_metrics.record_stage(conversation_id, "hotword")
             logger.info(f"📊 Conversation state: {conversation_manager.get_current_state().value}")
         
     except Exception as e:
@@ -180,6 +180,7 @@ def on_vad_state_change(is_speech: bool, vad_state_str: str):
 
 async def _process_speech_segment():
     """Process the buffered speech segment with STT."""
+    global pipeline_metrics
     try:
         if not conversation_manager or not conversation_manager.is_in_conversation():
             return
@@ -192,9 +193,20 @@ async def _process_speech_segment():
         # Process audio buffer with STT
         transcription, confidence, is_valid = await conversation_manager.process_audio_buffer()
         
+        context = conversation_manager.current_context
         if is_valid and transcription:
             print(f"💬 You said: '{transcription}' (confidence: {confidence:.2f})")
             print("🤖 Waiting for ADRIAN's response...\n")
+            
+            if pipeline_metrics and context:
+                pipeline_metrics.record_stage(
+                    context.conversation_id,
+                    "stt_completed",
+                    transcript=transcription,
+                    confidence=confidence,
+                    retries=context.retry_count
+                )
+                context.retry_count = 0
             
             # Publish UtteranceEvent to Redis
             await _publish_utterance(transcription, confidence, conversation_manager.current_context)
@@ -215,6 +227,27 @@ async def _process_speech_segment():
                 
                 # Optionally publish error response so ADRIAN can speak it
                 await _publish_error_response(error_response, conversation_manager.current_context)
+            if context:
+                context.retry_count += 1
+                if pipeline_metrics:
+                    pipeline_metrics.record_stage(context.conversation_id, "retry")
+                    pipeline_metrics.record_error(context.conversation_id, "unclear_speech")
+                if (settings.conversation_retry_limit > 0 and 
+                        context.retry_count >= settings.conversation_retry_limit):
+                    if settings.error_beep_enabled:
+                        try:
+                            import platform
+                            if platform.system() == "Windows":
+                                import winsound
+                                winsound.Beep(settings.error_beep_frequency, settings.error_beep_duration_ms)
+                            else:
+                                import os
+                                os.system('echo -e "\a"')
+                        except Exception as beep_err:
+                            logger.debug(f"Could not play error beep: {beep_err}")
+                    apology = "I'm sorry, I still couldn't understand. Let's try again in a moment."
+                    await _publish_error_response(apology, context)
+                    conversation_manager.end_conversation()
             
             # Continue listening
             conversation_manager.current_state = ConversationState.CONTINUOUS
@@ -324,7 +357,7 @@ async def _handle_response_messages():
     Subscribe to 'responses' channel to know when ADRIAN is speaking.
     Pause VAD/callback during TTS (but keep hotword active for interruption).
     """
-    global audio_stream, _mic_paused_for_tts, _tts_is_playing
+    global audio_stream, _mic_paused_for_tts, _tts_is_playing, pipeline_metrics, _pending_resume_tasks
     
     logger.info("Starting response listener for echo prevention (hotword interruption enabled)...")
     redis_client = await get_redis_client()
@@ -339,31 +372,29 @@ async def _handle_response_messages():
             
             # Only pause if response should be spoken
             if response.should_speak and audio_stream and audio_stream.is_running:
-                # Estimate TTS duration (average ~150 words/min = ~2.5 words/sec)
-                # Add buffer for safety
+                correlation_id = response.correlation_id
+                if pipeline_metrics and settings.pipeline_metrics_enabled:
+                    pipeline_metrics.record_stage(
+                        correlation_id,
+                        "response_received",
+                        response_text=response.text
+                    )
+
                 word_count = len(response.text.split())
-                estimated_duration = (word_count / 2.5) + 0.5  # seconds
-                
-                logger.info(f"🔇 Pausing VAD for {estimated_duration:.1f}s (TTS: '{response.text[:50]}...')")
+                estimated_duration = max((word_count / 2.5) + 0.5, 2.0)
+
+                logger.info(f"🔇 Pausing VAD (estimate {estimated_duration:.1f}s) for TTS: '{response.text[:50]}...'")
                 logger.info("   💡 Hotword detection still active - say 'ADRIAN' to interrupt!")
                 print(f"\n[ECHO PREVENTION] Pausing normal speech recognition...")
                 print(f"   Say 'ADRIAN' to interrupt if needed!\n")
                 
-                # Mark TTS as playing and pause VAD/callback (but keep hotword active)
                 _mic_paused_for_tts = True
                 _tts_is_playing = True
                 audio_stream.pause()  # Pause VAD and callback (hotword still active)
-                
-                # Resume after estimated duration + buffer
-                await asyncio.sleep(estimated_duration + 0.5)  # Extra 0.5s buffer
-                
-                if audio_stream and _tts_is_playing:  # Only resume if not interrupted
-                    audio_stream.resume()  # Resume listening
-                    logger.info("✅ VAD resumed after TTS")
-                    print("[ECHO PREVENTION] Normal speech recognition resumed\n")
-                
-                _mic_paused_for_tts = False
-                _tts_is_playing = False
+                # Fallback in case we miss TTS end event
+                if correlation_id:
+                    resume_task = asyncio.create_task(_resume_after_timeout(correlation_id, estimated_duration + 1.0))
+                    _pending_resume_tasks[correlation_id] = resume_task
                 
         except Exception as e:
             logger.error(f"Error handling response for echo prevention: {e}")
@@ -375,6 +406,73 @@ async def _handle_response_messages():
     
     # Subscribe to responses channel
     await redis_client.subscribe("responses", handle_response)
+
+
+async def _resume_after_timeout(correlation_id: str, delay_seconds: float):
+    """Fallback resume if TTS completion event is missed."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        logger.warning(f"TTS end event not received for {correlation_id} - auto-resuming microphone")
+        _resume_microphone(correlation_id, reason="fallback_timer")
+    except asyncio.CancelledError:
+        logger.debug(f"Fallback resume cancelled for {correlation_id}")
+        raise
+
+
+def _resume_microphone(correlation_id: Optional[str], reason: str = "tts_event"):
+    """Resume microphone input after TTS finishes or is interrupted."""
+    global _mic_paused_for_tts, _tts_is_playing
+
+    task = _pending_resume_tasks.pop(correlation_id, None)
+    if task and not task.cancelled():
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if task is not current_task:
+            task.cancel()
+
+    if audio_stream and audio_stream.is_running and _mic_paused_for_tts:
+        audio_stream.resume()
+        logger.info(f"✅ VAD resumed ({reason})")
+        print("[ECHO PREVENTION] Normal speech recognition resumed\n")
+    _mic_paused_for_tts = False
+    _tts_is_playing = False
+
+
+async def _handle_tts_events():
+    """Listen for playback events to resume microphone accurately."""
+    global _tts_is_playing
+
+    logger.info("Starting TTS event listener for echo prevention...")
+    redis_client = await get_redis_client()
+
+    async def handle_event(data: dict):
+        global _tts_is_playing
+        try:
+            event = TTSPlaybackEvent(**data)
+            correlation_id = event.conversation_id or event.correlation_id
+
+            if event.event == "start":
+                _tts_is_playing = True
+                if pipeline_metrics and settings.pipeline_metrics_enabled and correlation_id:
+                    pipeline_metrics.record_stage(correlation_id, "tts_started")
+            elif event.event == "end":
+                if pipeline_metrics and settings.pipeline_metrics_enabled and correlation_id:
+                    pipeline_metrics.record_stage(correlation_id, "tts_completed")
+                _resume_microphone(correlation_id, reason="tts_completed")
+            elif event.event == "interrupted":
+                if pipeline_metrics and settings.pipeline_metrics_enabled and correlation_id:
+                    pipeline_metrics.record_stage(correlation_id, "interrupted")
+                _resume_microphone(correlation_id, reason="tts_interrupted")
+            elif event.event == "error":
+                if pipeline_metrics and settings.pipeline_metrics_enabled and correlation_id:
+                    pipeline_metrics.record_error(correlation_id, "tts_error")
+                _resume_microphone(correlation_id, reason="tts_error")
+        except Exception as exc:
+            logger.error(f"Error processing TTS event: {exc}")
+
+    await redis_client.subscribe("tts_events", handle_event)
 
 
 # =============================================================================
@@ -392,11 +490,17 @@ async def _handle_response_messages():
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     global audio_stream, conversation_manager, stt_processor, personality_handler, main_event_loop, _listening_for_responses
+    global pipeline_metrics
     
     # Store the main event loop for callbacks
     main_event_loop = asyncio.get_event_loop()
     
     logger.info("🚀 Starting IO Service...")
+    if settings.pipeline_metrics_enabled:
+        pipeline_metrics = VoicePipelineMetrics(settings.pipeline_latency_target_ms)
+        logger.info(f"Pipeline metrics enabled (target: {settings.pipeline_latency_target_ms}ms)")
+    else:
+        pipeline_metrics = None
     
     # Connect to Redis
     redis_client = await get_redis_client()
@@ -405,6 +509,7 @@ async def lifespan(app: FastAPI):
     # Start listening for responses (to pause mic during TTS)
     _listening_for_responses = True
     asyncio.create_task(_handle_response_messages())
+    asyncio.create_task(_handle_tts_events())
     logger.info("✅ Response listener started (echo prevention enabled)")
     
     # Initialize STT processor with configuration
@@ -453,8 +558,20 @@ async def lifespan(app: FastAPI):
     # Initialize audio stream with full pipeline integration and configuration
     try:
         logger.info(f"Initializing audio stream (VAD: {settings.vad_aggressiveness}, hotword_sens: {settings.hotword_sensitivity})...")
+        mic_device_index = settings.microphone_device_index
+        if mic_device_index is None:
+            try:
+                mic_device_index = select_input_device(settings.microphone_device_name)
+            except Exception as device_err:
+                logger.warning(f"Failed to resolve microphone device: {device_err}")
+                mic_device_index = None
+
+        if mic_device_index is not None:
+            logger.info(f"Using microphone device index: {mic_device_index}")
+
         audio_stream = AudioStream(
             callback=on_audio_chunk,
+            device=mic_device_index,
             enable_vad=True,
             vad_aggressiveness=settings.vad_aggressiveness,
             vad_callback=on_vad_state_change,
@@ -742,6 +859,40 @@ async def get_stt_status():
             "status": "error",
             "message": f"Error getting status: {str(e)}"
         }
+
+
+# =============================================================================
+# Pipeline Metrics & Audio Device Introspection
+# =============================================================================
+
+
+@app.get("/status/pipeline")
+async def get_pipeline_status():
+    """Return pipeline latency metrics."""
+    if not settings.pipeline_metrics_enabled or pipeline_metrics is None:
+        return {
+            "status": "disabled",
+            "message": "Pipeline metrics tracking disabled"
+        }
+    return {
+        "status": "ok",
+        "metrics": pipeline_metrics.get_summary()
+    }
+
+
+@app.get("/audio/devices")
+async def list_devices():
+    """List available audio input/output devices."""
+    try:
+        devices = list_audio_devices()
+        return {
+            "status": "ok",
+            "count": len(devices),
+            "devices": devices
+        }
+    except Exception as exc:
+        logger.error(f"Failed to list audio devices: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # TTS status endpoint removed - TTS is handled by Output Service

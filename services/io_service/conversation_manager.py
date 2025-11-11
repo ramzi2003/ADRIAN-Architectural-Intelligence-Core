@@ -46,6 +46,8 @@ class ConversationContext:
     conversation_history: List[Dict[str, str]]  # [{"role": "user/assistant", "text": "..."}]
     current_topic: Optional[str] = None
     confidence_history: List[float] = None
+    hotword_detected_at: float = 0.0
+    retry_count: int = 0
     
     def __post_init__(self):
         if self.confidence_history is None:
@@ -101,7 +103,7 @@ class ConversationManager:
         
         logger.info(f"Conversation Manager initialized (timeout: {conversation_timeout}s, max_turns: {max_context_turns})")
     
-    def start_conversation(self, user_id: str = "default_user") -> str:
+    def start_conversation(self, user_id: str = "default_user", hotword_timestamp: Optional[float] = None) -> str:
         """
         Start a new conversation after hotword detection.
         
@@ -112,15 +114,17 @@ class ConversationManager:
             Conversation ID
         """
         conversation_id = f"conv_{int(time.time() * 1000)}"
+        hotword_time = hotword_timestamp or time.time()
         
         self.current_context = ConversationContext(
             user_id=user_id,
             conversation_id=conversation_id,
-            start_time=time.time(),
-            last_activity=time.time(),
+            start_time=hotword_time,
+            last_activity=hotword_time,
             turn_count=0,
             last_transcription="",
-            conversation_history=[]
+            conversation_history=[],
+            hotword_detected_at=hotword_time
         )
         
         self.current_state = ConversationState.LISTENING

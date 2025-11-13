@@ -26,6 +26,18 @@ from shared.schemas import (
 from shared.redis_client import get_redis_client
 from shared.logging_config import setup_logging
 
+from services.processing_service.llm_runtime import (
+    LLMRuntime,
+    LLMRuntimeError,
+    get_runtime,
+)
+from services.processing_service.intent_classifier import (
+    IntentClassifier,
+    IntentClassifierError,
+    IntentPrediction,
+    get_classifier,
+)
+
 # Setup logging
 logger = setup_logging("processing-service")
 settings = get_settings()
@@ -40,6 +52,8 @@ class ProcessRequest(BaseModel):
 
 # Background task flag
 _listening = False
+_llm_runtime: Optional[LLMRuntime] = None
+_intent_classifier: Optional[IntentClassifier] = None
 
 
 # Lifespan context manager
@@ -52,6 +66,28 @@ async def lifespan(app: FastAPI):
     # Connect to Redis
     redis_client = await get_redis_client()
     logger.info("Connected to Redis")
+
+    # Initialize local LLM runtime if configured
+    if settings.llm_provider == "llama_cpp":
+        try:
+            global _llm_runtime
+            _llm_runtime = await get_runtime()
+            await _llm_runtime.warmup()
+        except LLMRuntimeError as exc:
+            logger.error("Failed to initialize local LLM runtime: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Unexpected LLM initialization error: %s", exc)
+    else:
+        _llm_runtime = None
+
+    # Initialize intent classifier (optional)
+    try:
+        global _intent_classifier
+        _intent_classifier = await get_classifier()
+    except IntentClassifierError as exc:
+        logger.error("Failed to initialize intent classifier: %s", exc)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Unexpected intent classifier error: %s", exc)
     
     # Start background listener for utterances
     _listening = True
@@ -85,6 +121,24 @@ app = FastAPI(
 async def health_check():
     """Health check endpoint."""
     ollama_status = await check_ollama_connection()
+    llm_status = "not_configured"
+    classifier_status = "not_loaded"
+    if settings.llm_provider == "llama_cpp":
+        runtime = _llm_runtime
+        if runtime and runtime.is_loaded:
+            llm_status = "loaded"
+        else:
+            llm_status = "loading_failed" if runtime else "not_loaded"
+    else:
+        llm_status = settings.llm_provider
+
+    classifier = _intent_classifier
+    if classifier and classifier.is_loaded:
+        classifier_status = "loaded"
+    elif classifier is None:
+        classifier_status = "not_initialized"
+    else:
+        classifier_status = "loading_failed"
     
     return HealthResponse(
         service_name="processing-service",
@@ -92,6 +146,8 @@ async def health_check():
         dependencies={
             "redis": "connected",
             "ollama": ollama_status,
+            "llm_runtime": llm_status,
+            "intent_classifier": classifier_status,
             "gemini": "not_configured" if not settings.gemini_api_key else "ready"
         }
     )
@@ -154,8 +210,10 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
     # TODO: Make actual call to memory-service
     context = await query_memory_context(text, correlation_id)
     
-    # Step 2: Classify intent (STUB)
-    intent, parameters = await classify_intent(text, context)
+    # Step 2: Classify intent
+    prediction = await classify_intent(text, context)
+    intent = prediction.label
+    parameters = prediction.parameters
     
     # Step 3: Generate response (STUB)
     response_text = await generate_response(text, intent, context)
@@ -171,10 +229,15 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
             intent=intent,
             parameters=parameters,
             requires_permission=intent in ["delete_file", "shutdown", "install_app"],
-            confidence=0.85
+            confidence=prediction.confidence
         )
         await redis_client.publish("action_specs", action_spec)
-        logger.info(f"Published action_spec: {intent}")
+        logger.info(
+            "Published action_spec: %s (confidence=%.2f, classifier=%s)",
+            intent,
+            prediction.confidence,
+            "trained" if prediction.used_classifier else "heuristic",
+        )
     
     # Step 6: Emit response_text
     response = ResponseText(
@@ -202,35 +265,48 @@ async def query_memory_context(text: str, correlation_id: str) -> dict:
     return {"context": "stub_context", "history": []}
 
 
-async def classify_intent(text: str, context: dict) -> tuple[str, dict]:
+async def classify_intent(text: str, context: dict) -> IntentPrediction:
     """
-    Classify user intent from text.
-    TODO: Implement intent classification using local LLM or lightweight model.
-    
-    Possible intents:
-    - open_app
-    - close_app
-    - search
-    - reminder
-    - file_operation
-    - system_control
-    - conversation
+    Determine the user's intent using the fine-tuned classifier when available.
+    Falls back to heuristic rules on failure.
     """
-    text_lower = text.lower()
-    
-    # Simple rule-based classification (STUB)
-    if "open" in text_lower:
-        app_name = text_lower.replace("open", "").strip()
-        return "open_app", {"app_name": app_name}
-    elif "close" in text_lower:
-        app_name = text_lower.replace("close", "").strip()
-        return "close_app", {"app_name": app_name}
-    elif "search" in text_lower or "find" in text_lower:
-        return "search", {"query": text}
-    elif "remind" in text_lower:
-        return "reminder", {"text": text}
+    classifier = _intent_classifier
+    if classifier and classifier.is_loaded:
+        prediction = await classifier.predict(text, context)
     else:
-        return "conversation", {}
+        logger.debug("Intent classifier unavailable; using heuristic rules.")
+        fallback_classifier = await get_classifier()
+        prediction = await fallback_classifier.predict(text, context)
+
+    threshold = settings.intent_classifier_confidence_threshold
+    fallback_route = settings.intent_classifier_low_confidence_route or "conversation"
+
+    final_label = prediction.label
+    final_parameters = prediction.parameters
+    if prediction.confidence < threshold and final_label != fallback_route:
+        logger.info(
+            "Intent confidence %.2f below threshold %.2f for '%s'; rerouting to %s.",
+            prediction.confidence,
+            threshold,
+            final_label,
+            fallback_route,
+        )
+        final_label = fallback_route
+        final_parameters = {}
+        rerouted = IntentPrediction(
+            label=final_label,
+            confidence=prediction.confidence,
+            parameters=final_parameters,
+            used_classifier=prediction.used_classifier,
+        )
+        return rerouted
+
+    return IntentPrediction(
+        label=final_label,
+        confidence=prediction.confidence,
+        parameters=final_parameters,
+        used_classifier=prediction.used_classifier,
+    )
 
 
 async def generate_response(text: str, intent: str, context: dict) -> str:
@@ -239,24 +315,40 @@ async def generate_response(text: str, intent: str, context: dict) -> str:
     TODO: Implement actual LLM call.
     """
     logger.info(f"[STUB] Generating response for intent: {intent}")
-    
-    # Try Ollama first (local)
-    try:
-        response = await call_ollama(text, context)
-        return response
-    except Exception as e:
-        logger.warning(f"Ollama call failed: {e}, falling back to echo response")
-        # Echo response for testing - confirms it heard you correctly
-        text_lower = text.lower()
-        if "hello" in text_lower or "hi" in text_lower:
-            return "Hello, Sir. How may I assist you?"
-        elif "how are you" in text_lower:
-            return "I'm functioning perfectly, Sir. Thank you for asking."
-        elif "what" in text_lower and "time" in text_lower:
-            from datetime import datetime
-            return f"The current time is {datetime.now().strftime('%I:%M %p')}, Sir."
+    llm_provider = settings.llm_provider.lower()
+
+    if llm_provider == "llama_cpp":
+        prompt = build_structured_prompt(text, intent, context)
+        runtime = _llm_runtime
+        if runtime is None:
+            logger.warning("LLM runtime not available; falling back to stub.")
         else:
-            return f"I heard you say: {text}. At your service, Sir."
+            try:
+                generated = await runtime.generate(prompt)
+                return generated.strip()
+            except LLMRuntimeError as exc:
+                logger.error("Local LLM generation failed: %s", exc)
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Unexpected LLM error: %s", exc)
+
+    if llm_provider == "ollama":
+        try:
+            response = await call_ollama(text, context)
+            return response
+        except Exception as e:
+            logger.warning(f"Ollama call failed: {e}, falling back to echo response")
+
+    # Echo response for testing - confirms it heard you correctly
+    text_lower = text.lower()
+    if "hello" in text_lower or "hi" in text_lower:
+        return "Hello, Sir. How may I assist you?"
+    elif "how are you" in text_lower:
+        return "I'm functioning perfectly, Sir. Thank you for asking."
+    elif "what" in text_lower and "time" in text_lower:
+        from datetime import datetime
+        return f"The current time is {datetime.now().strftime('%I:%M %p')}, Sir."
+    else:
+        return f"I heard you say: {text}. At your service, Sir."
 
 
 async def apply_personality(response: str, intent: str) -> str:
@@ -269,6 +361,32 @@ async def apply_personality(response: str, intent: str) -> str:
     # Response already has personality, just return it
     # (Avoid double-prefixing since generate_response already adds it)
     return response
+
+
+def build_structured_prompt(text: str, intent: str, context: dict) -> str:
+    """
+    Compose a system-style prompt for the local LLM with minimal formatting.
+    """
+    persona = settings.llm_persona_default
+    conversation_history = context.get("history", [])
+    history_blocks = []
+    for turn in conversation_history[-3:]:
+        speaker = turn.get("speaker", "User")
+        utterance = turn.get("text") or ""
+        history_blocks.append(f"{speaker}: {utterance}")
+    history_text = "\n".join(history_blocks) if history_blocks else "None"
+
+    return (
+        "You are ADRIAN, an efficient desktop AI assistant with a Jarvis-like tone.\n"
+        f"Persona preset: {persona}.\n"
+        "Follow system policy: be concise, decisive, and helpful. "
+        "If the user asks for time, include the current system time.\n"
+        f"Detected intent: {intent}.\n"
+        f"Conversation history:\n{history_text}\n"
+        "User request:\n"
+        f"{text}\n"
+        "Respond with a single concise paragraph.\n"
+    )
 
 
 async def call_ollama(prompt: str, context: dict) -> str:

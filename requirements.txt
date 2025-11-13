@@ -31,6 +31,9 @@ sentence-transformers==2.2.2  # Stable with torch 2.1 CPU build
 torch==2.1.0+cpu  # Lightweight CPU wheel keeps install fast and compatible
 torchaudio==2.1.0+cpu  # Match torch version for TTS dependencies
 transformers==4.35.0
+llama-cpp-python>=0.2.86  # Local GGUF runtime for quantized Mistral/LLaMA
+datasets>=2.16.0  # Training utilities for intent classifier
+tqdm>=4.66.0  # Progress bars for training scripts
 
 # Google Gemini API (Cloud LLM)
 google-generativeai>=0.3.2

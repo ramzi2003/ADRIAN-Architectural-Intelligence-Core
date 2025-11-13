@@ -38,6 +38,34 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-pro"
     
+    # Local LLM Runtime
+    llm_provider: str = "llama_cpp"  # llama_cpp, ollama, gemini
+    llm_model_name: str = "mistral-7b-instruct-q4_0"
+    llm_model_path: str = "models/llm/mistral-7b-instruct-q4_0.gguf"
+    llm_thread_count: int = max(1, os.cpu_count() or 1)
+    llm_gpu_layers: int = 0  # 0 keeps inference on CPU; >0 for GPU acceleration
+    llm_context_window: int = 4096
+    llm_max_output_tokens: int = 512
+    llm_temperature: float = 0.75
+    llm_top_p: float = 0.9
+    llm_top_k: int = 40
+    llm_repeat_penalty: float = 1.1
+    llm_persona_default: str = "jarvis"
+    llm_warmup_prompt: str = "Explain the mission of project ADRIAN in one sentence."
+    
+    # Intent Classifier
+    intent_classifier_model_path: str = "models/intent_classifier"
+    intent_classifier_device: str = "cpu"
+    intent_classifier_confidence_threshold: float = 0.6
+    intent_classifier_low_confidence_route: str = "conversation"
+    intent_classifier_label_map: tuple[str, ...] = (
+        "system_control",
+        "search",
+        "task_management",
+        "conversation",
+    )
+    intent_classifier_enable_context: bool = True
+    
     # Porcupine (Hotword Detection)
     picovoice_access_key: Optional[str] = None
     hotword_sensitivity: float = 0.7  # 0.1-1.0

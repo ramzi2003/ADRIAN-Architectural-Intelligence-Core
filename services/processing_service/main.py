@@ -10,6 +10,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 import asyncio
+import time
 import uuid
 import httpx
 from contextlib import asynccontextmanager
@@ -37,6 +38,16 @@ from services.processing_service.intent_classifier import (
     IntentPrediction,
     get_classifier,
 )
+from services.processing_service.routing_controller import (
+    RoutingController,
+    RouteType,
+    RoutingDecision,
+    get_routing_controller,
+)
+from services.processing_service.processing_metrics import (
+    ProcessingServiceMetrics,
+    get_metrics,
+)
 
 # Setup logging
 logger = setup_logging("processing-service")
@@ -54,6 +65,8 @@ class ProcessRequest(BaseModel):
 _listening = False
 _llm_runtime: Optional[LLMRuntime] = None
 _intent_classifier: Optional[IntentClassifier] = None
+_routing_controller: Optional[RoutingController] = None
+_processing_metrics: Optional[ProcessingServiceMetrics] = None
 
 
 # Lifespan context manager
@@ -88,6 +101,16 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to initialize intent classifier: %s", exc)
     except Exception as exc:  # pragma: no cover
         logger.exception("Unexpected intent classifier error: %s", exc)
+    
+    # Initialize routing controller
+    global _routing_controller
+    _routing_controller = get_routing_controller(settings)
+    logger.info("Routing controller initialized")
+    
+    # Initialize processing metrics
+    global _processing_metrics
+    _processing_metrics = get_metrics()
+    logger.info("Processing metrics initialized")
     
     # Start background listener for utterances
     _listening = True
@@ -167,6 +190,14 @@ async def process_text(request: ProcessRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/metrics")
+async def get_processing_metrics():
+    """Get processing service metrics summary."""
+    if _processing_metrics is None:
+        raise HTTPException(status_code=503, detail="Metrics not initialized")
+    return _processing_metrics.get_summary()
+
+
 async def listen_for_utterances():
     """
     Background task that listens to utterance events from Redis.
@@ -195,65 +226,135 @@ async def listen_for_utterances():
 
 async def process_utterance(text: str, user_id: str, correlation_id: Optional[str] = None):
     """
-    Main processing pipeline:
+    Main processing pipeline with routing:
     1. Query memory for context
     2. Classify intent
-    3. Generate response with personality
-    4. Emit action_spec and response_text
+    3. Route decision (direct handler vs LLM vs deferred)
+    4. Execute based on route
+    5. Generate response with personality
+    6. Emit action_spec and response_text
     """
     if correlation_id is None:
         correlation_id = str(uuid.uuid4())
     
+    start_time = time.perf_counter()
     redis_client = await get_redis_client()
     
-    # Step 1: Query memory service for context (STUB)
-    # TODO: Make actual call to memory-service
-    context = await query_memory_context(text, correlation_id)
+    # Initialize metrics tracking
+    if _processing_metrics:
+        _processing_metrics.start_conversation(correlation_id)
     
-    # Step 2: Classify intent
-    prediction = await classify_intent(text, context)
-    intent = prediction.label
-    parameters = prediction.parameters
-    
-    # Step 3: Generate response (STUB)
-    response_text = await generate_response(text, intent, context)
-    
-    # Step 4: Apply personality/wit module (STUB)
-    response_text = await apply_personality(response_text, intent)
-    
-    # Step 5: Emit action_spec if needed
-    if intent != "conversation":
-        action_spec = ActionSpec(
+    try:
+        # Step 1: Query memory service for context (STUB)
+        # TODO: Make actual call to memory-service
+        context = await query_memory_context(text, correlation_id)
+        
+        # Step 2: Classify intent
+        intent_start = time.perf_counter()
+        prediction = await classify_intent(text, context)
+        intent_latency_ms = (time.perf_counter() - intent_start) * 1000
+        
+        if _processing_metrics:
+            _processing_metrics.record_intent_classification(
+                correlation_id,
+                prediction.label,
+                prediction.confidence,
+                intent_latency_ms
+            )
+        
+        intent = prediction.label
+        parameters = prediction.parameters
+        
+        # Step 3: Routing decision
+        routing_start = time.perf_counter()
+        if _routing_controller is None:
+            raise RuntimeError("Routing controller not initialized")
+        
+        routing_decision = _routing_controller.decide_route(text, prediction, context)
+        routing_latency_ms = (time.perf_counter() - routing_start) * 1000
+        
+        if _processing_metrics:
+            _processing_metrics.record_routing_decision(
+                correlation_id,
+                routing_decision,
+                routing_latency_ms
+            )
+        
+        logger.info(
+            "Routing decision: %s for intent '%s' (reason: %s, estimated: %dms)",
+            routing_decision.route_type.value,
+            routing_decision.intent,
+            routing_decision.reason,
+            routing_decision.estimated_latency_ms
+        )
+        
+        # Step 4: Execute based on route
+        response_start = time.perf_counter()
+        response_text = await execute_route(
+            routing_decision,
+            text,
+            intent,
+            parameters,
+            context
+        )
+        response_latency_ms = (time.perf_counter() - response_start) * 1000
+        
+        if _processing_metrics:
+            _processing_metrics.record_response_generation(
+                correlation_id,
+                response_latency_ms
+            )
+        
+        # Step 5: Apply personality/wit module (STUB)
+        response_text = await apply_personality(response_text, intent)
+        
+        # Step 6: Emit action_spec if needed
+        if intent != "conversation" and routing_decision.route_type != RouteType.DEFERRED_TASK:
+            action_spec = ActionSpec(
+                message_id=str(uuid.uuid4()),
+                correlation_id=correlation_id,
+                intent=intent,
+                parameters=parameters,
+                requires_permission=routing_decision.requires_permission,
+                confidence=prediction.confidence
+            )
+            await redis_client.publish("action_specs", action_spec)
+            logger.info(
+                "Published action_spec: %s (confidence=%.2f, route=%s)",
+                intent,
+                prediction.confidence,
+                routing_decision.route_type.value,
+            )
+        
+        # Step 7: Emit response_text
+        response = ResponseText(
             message_id=str(uuid.uuid4()),
             correlation_id=correlation_id,
-            intent=intent,
-            parameters=parameters,
-            requires_permission=intent in ["delete_file", "shutdown", "install_app"],
-            confidence=prediction.confidence
+            text=response_text,
+            should_speak=True
         )
-        await redis_client.publish("action_specs", action_spec)
-        logger.info(
-            "Published action_spec: %s (confidence=%.2f, classifier=%s)",
-            intent,
-            prediction.confidence,
-            "trained" if prediction.used_classifier else "heuristic",
-        )
+        await redis_client.publish("responses", response)
+        logger.info(f"Published response: '{response_text}'")
+        
+        # Record completion
+        total_latency_ms = (time.perf_counter() - start_time) * 1000
+        if _processing_metrics:
+            _processing_metrics.finish_conversation(correlation_id, total_latency_ms)
+        
+        return {
+            "intent": intent,
+            "response": response_text,
+            "correlation_id": correlation_id,
+            "route_type": routing_decision.route_type.value,
+            "route_reason": routing_decision.reason,
+            "total_latency_ms": total_latency_ms
+        }
     
-    # Step 6: Emit response_text
-    response = ResponseText(
-        message_id=str(uuid.uuid4()),
-        correlation_id=correlation_id,
-        text=response_text,
-        should_speak=True
-    )
-    await redis_client.publish("responses", response)
-    logger.info(f"Published response: '{response_text}'")
-    
-    return {
-        "intent": intent,
-        "response": response_text,
-        "correlation_id": correlation_id
-    }
+    except Exception as e:
+        logger.exception(f"Error processing utterance: {e}")
+        if _processing_metrics:
+            _processing_metrics.record_error(correlation_id, str(e), type(e).__name__)
+        raise
 
 
 async def query_memory_context(text: str, correlation_id: str) -> dict:
@@ -307,6 +408,61 @@ async def classify_intent(text: str, context: dict) -> IntentPrediction:
         parameters=final_parameters,
         used_classifier=prediction.used_classifier,
     )
+
+
+async def execute_route(
+    decision: RoutingDecision,
+    text: str,
+    intent: str,
+    parameters: dict,
+    context: dict
+) -> str:
+    """
+    Execute the routing decision.
+    
+    Routes to:
+    - Direct handler: Fast rule-based response
+    - LLM call: Full LLM reasoning
+    - Deferred task: Queue for later execution
+    """
+    if decision.route_type == RouteType.DIRECT_HANDLER:
+        return await handle_direct_intent(intent, parameters, text)
+    elif decision.route_type == RouteType.LLM_CALL:
+        return await generate_response(text, intent, context)
+    elif decision.route_type == RouteType.DEFERRED_TASK:
+        # For now, handle deferred tasks immediately but log them
+        logger.info("Deferred task detected - executing immediately (TODO: implement queue)")
+        return await generate_response(text, intent, context)
+    else:
+        # Fallback to LLM
+        logger.warning(f"Unknown route type {decision.route_type}, falling back to LLM")
+        return await generate_response(text, intent, context)
+
+
+async def handle_direct_intent(intent: str, parameters: dict, text: str) -> str:
+    """
+    Handle simple intents directly without LLM.
+    Fast, rule-based responses for well-defined actions.
+    """
+    if intent == "system_control":
+        action = parameters.get("action", "").lower()
+        target = parameters.get("target", "").strip()
+        
+        if action == "open":
+            if target:
+                return f"Opening {target}, Sir."
+            else:
+                return "I need to know what you'd like me to open, Sir."
+        elif action == "close":
+            if target:
+                return f"Closing {target}, Sir."
+            else:
+                return "I need to know what you'd like me to close, Sir."
+        else:
+            return f"Executing {action} for {target}, Sir."
+    
+    # Fallback for other intents
+    return f"Handling {intent}, Sir."
 
 
 async def generate_response(text: str, intent: str, context: dict) -> str:

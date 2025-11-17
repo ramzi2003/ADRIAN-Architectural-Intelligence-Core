@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     )
     intent_classifier_enable_context: bool = True
     
+    # Routing Controller
+    routing_direct_handler_intents: tuple[str, ...] = ("system_control",)
+    routing_deferred_task_intents: tuple[str, ...] = ("task_management",)
+    routing_llm_required_intents: tuple[str, ...] = ("conversation", "search")
+    routing_enable_metrics: bool = True
+    routing_metrics_history_size: int = 100
+    
     # Porcupine (Hotword Detection)
     picovoice_access_key: Optional[str] = None
     hotword_sensitivity: float = 0.7  # 0.1-1.0

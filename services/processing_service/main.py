@@ -48,6 +48,11 @@ from services.processing_service.processing_metrics import (
     ProcessingServiceMetrics,
     get_metrics,
 )
+from services.processing_service.intent_handlers import (
+    handle_intent,
+    HandlerResponse,
+    get_handler,
+)
 
 # Setup logging
 logger = setup_logging("processing-service")
@@ -290,7 +295,7 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
         
         # Step 4: Execute based on route
         response_start = time.perf_counter()
-        response_text = await execute_route(
+        handler_response = await execute_route(
             routing_decision,
             text,
             intent,
@@ -306,10 +311,35 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
             )
         
         # Step 5: Apply personality/wit module (STUB)
-        response_text = await apply_personality(response_text, intent)
+        # Note: Personality is typically applied in handlers, but we can enhance here if needed
+        response_text = await apply_personality(handler_response.text, intent)
         
         # Step 6: Emit action_spec if needed
-        if intent != "conversation" and routing_decision.route_type != RouteType.DEFERRED_TASK:
+        # Use action_spec from handler if available, otherwise create from routing decision
+        if handler_response.action_spec:
+            # Handler provided action_spec dict - extract fields
+            handler_action_spec = handler_response.action_spec
+            action_spec = ActionSpec(
+                message_id=str(uuid.uuid4()),
+                correlation_id=correlation_id,
+                intent=handler_action_spec.get("intent", intent),
+                parameters={
+                    **parameters,  # Start with original parameters
+                    **{k: v for k, v in handler_action_spec.items() 
+                       if k not in ["intent", "requires_permission"]}  # Merge handler params
+                },
+                requires_permission=handler_action_spec.get("requires_permission", routing_decision.requires_permission),
+                confidence=prediction.confidence
+            )
+            await redis_client.publish("action_specs", action_spec)
+            logger.info(
+                "Published action_spec: %s (confidence=%.2f, route=%s)",
+                intent,
+                prediction.confidence,
+                routing_decision.route_type.value,
+            )
+        elif intent != "conversation" and routing_decision.route_type != RouteType.DEFERRED_TASK:
+            # Fallback: create action_spec from routing decision
             action_spec = ActionSpec(
                 message_id=str(uuid.uuid4()),
                 correlation_id=correlation_id,
@@ -327,11 +357,14 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
             )
         
         # Step 7: Emit response_text
+        # Extract emotion from handler metadata if available
+        emotion = handler_response.metadata.get("emotion")
         response = ResponseText(
             message_id=str(uuid.uuid4()),
             correlation_id=correlation_id,
             text=response_text,
-            should_speak=True
+            should_speak=True,
+            emotion=emotion
         )
         await redis_client.publish("responses", response)
         logger.info(f"Published response: '{response_text}'")
@@ -347,7 +380,9 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
             "correlation_id": correlation_id,
             "route_type": routing_decision.route_type.value,
             "route_reason": routing_decision.reason,
-            "total_latency_ms": total_latency_ms
+            "total_latency_ms": total_latency_ms,
+            "handler_metadata": handler_response.metadata,
+            "action_spec_created": handler_response.action_spec is not None
         }
     
     except Exception as e:
@@ -416,53 +451,80 @@ async def execute_route(
     intent: str,
     parameters: dict,
     context: dict
-) -> str:
+) -> HandlerResponse:
     """
     Execute the routing decision.
     
     Routes to:
-    - Direct handler: Fast rule-based response
-    - LLM call: Full LLM reasoning
+    - Direct handler: Fast rule-based response using intent handlers
+    - LLM call: Full LLM reasoning (may still use handlers for structure)
     - Deferred task: Queue for later execution
+    
+    Returns:
+        HandlerResponse with normalized output
     """
     if decision.route_type == RouteType.DIRECT_HANDLER:
-        return await handle_direct_intent(intent, parameters, text)
+        # Use intent handler for direct responses
+        try:
+            handler_response = await handle_intent(intent, text, parameters, context, settings)
+            return handler_response
+        except ValueError:
+            # No handler found, fallback to LLM
+            logger.warning(f"No handler for intent '{intent}', falling back to LLM")
+            response_text = await generate_response(text, intent, context)
+            return HandlerResponse(
+                text=response_text,
+                action_spec=None,
+                metadata={"intent": intent, "fallback": True}
+            )
+    
     elif decision.route_type == RouteType.LLM_CALL:
-        return await generate_response(text, intent, context)
+        # For LLM calls, try handler first for structure, then enhance with LLM
+        # If handler exists, use it; otherwise use LLM directly
+        handler = get_handler(intent, settings)
+        if handler:
+            # Use handler to get structured response, then enhance with LLM if needed
+            handler_response = await handler.handle(text, parameters, context)
+            # For conversation intents, enhance with LLM
+            if intent == "conversation" or handler_response.metadata.get("requires_llm"):
+                llm_text = await generate_response(text, intent, context)
+                handler_response.text = llm_text
+            return handler_response
+        else:
+            # No handler, use LLM directly
+            response_text = await generate_response(text, intent, context)
+            return HandlerResponse(
+                text=response_text,
+                action_spec=None,
+                metadata={"intent": intent, "llm_generated": True}
+            )
+    
     elif decision.route_type == RouteType.DEFERRED_TASK:
-        # For now, handle deferred tasks immediately but log them
+        # For deferred tasks, use handler to create structured response
+        # In production, this would queue the task
         logger.info("Deferred task detected - executing immediately (TODO: implement queue)")
-        return await generate_response(text, intent, context)
+        try:
+            handler_response = await handle_intent(intent, text, parameters, context, settings)
+            handler_response.metadata["deferred"] = True
+            return handler_response
+        except ValueError:
+            # Fallback to LLM
+            response_text = await generate_response(text, intent, context)
+            return HandlerResponse(
+                text=response_text,
+                action_spec=None,
+                metadata={"intent": intent, "deferred": True, "fallback": True}
+            )
+    
     else:
         # Fallback to LLM
         logger.warning(f"Unknown route type {decision.route_type}, falling back to LLM")
-        return await generate_response(text, intent, context)
-
-
-async def handle_direct_intent(intent: str, parameters: dict, text: str) -> str:
-    """
-    Handle simple intents directly without LLM.
-    Fast, rule-based responses for well-defined actions.
-    """
-    if intent == "system_control":
-        action = parameters.get("action", "").lower()
-        target = parameters.get("target", "").strip()
-        
-        if action == "open":
-            if target:
-                return f"Opening {target}, Sir."
-            else:
-                return "I need to know what you'd like me to open, Sir."
-        elif action == "close":
-            if target:
-                return f"Closing {target}, Sir."
-            else:
-                return "I need to know what you'd like me to close, Sir."
-        else:
-            return f"Executing {action} for {target}, Sir."
-    
-    # Fallback for other intents
-    return f"Handling {intent}, Sir."
+        response_text = await generate_response(text, intent, context)
+        return HandlerResponse(
+            text=response_text,
+            action_spec=None,
+            metadata={"intent": intent, "fallback": True}
+        )
 
 
 async def generate_response(text: str, intent: str, context: dict) -> str:

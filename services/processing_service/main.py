@@ -53,6 +53,11 @@ from services.processing_service.intent_handlers import (
     HandlerResponse,
     get_handler,
 )
+from services.processing_service.personality_wit import (
+    rewrite_with_personality,
+    TonePreset,
+    get_personality_rewriter,
+)
 
 # Setup logging
 logger = setup_logging("processing-service")
@@ -203,6 +208,101 @@ async def get_processing_metrics():
     return _processing_metrics.get_summary()
 
 
+@app.post("/personality/tone")
+async def set_tone_override(
+    tone: str,
+    duration_seconds: Optional[int] = None
+):
+    """
+    Set a temporary tone override for subsequent responses.
+    
+    Args:
+        tone: Tone preset name (jarvis, formal, minimal, friendly, sarcastic, professional)
+        duration_seconds: Optional duration for override (None = until next override)
+    
+    Returns:
+        Confirmation message
+    """
+    try:
+        tone_preset = TonePreset(tone.lower())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid tone: {tone}. Must be one of: {[t.value for t in TonePreset]}"
+        )
+    
+    # Store override in a simple in-memory cache (in production, use Redis or database)
+    # For now, this is a stub - actual implementation would store per-user/session
+    logger.info(f"Tone override set to: {tone_preset.value} (duration: {duration_seconds}s)")
+    
+    return {
+        "status": "success",
+        "tone": tone_preset.value,
+        "duration_seconds": duration_seconds,
+        "message": f"Tone override set to {tone_preset.value}"
+    }
+
+
+@app.get("/personality/tone")
+async def get_current_tone():
+    """Get current personality tone configuration."""
+    rewriter = get_personality_rewriter(settings)
+    current_tone = rewriter._default_config.tone
+    
+    return {
+        "tone": current_tone.value,
+        "available_tones": [t.value for t in TonePreset],
+        "config": {
+            "use_contractions": rewriter._default_config.use_contractions,
+            "add_sir": rewriter._default_config.add_sir,
+            "wit_level": rewriter._default_config.wit_level,
+            "formality_level": rewriter._default_config.formality_level,
+        }
+    }
+
+
+@app.post("/personality/config")
+async def update_personality_config(
+    use_contractions: Optional[bool] = None,
+    add_sir: Optional[bool] = None,
+    wit_level: Optional[int] = None,
+    formality_level: Optional[int] = None,
+):
+    """
+    Update personality configuration.
+    
+    Args:
+        use_contractions: Whether to use contractions
+        add_sir: Whether to add "Sir" to responses
+        wit_level: Wit level (0-3)
+        formality_level: Formality level (0-4)
+    
+    Returns:
+        Updated configuration
+    """
+    rewriter = get_personality_rewriter(settings)
+    
+    if use_contractions is not None:
+        rewriter._default_config.use_contractions = use_contractions
+    if add_sir is not None:
+        rewriter._default_config.add_sir = add_sir
+    if wit_level is not None:
+        rewriter._default_config.wit_level = max(0, min(3, wit_level))
+    if formality_level is not None:
+        rewriter._default_config.formality_level = max(0, min(4, formality_level))
+    
+    return {
+        "status": "success",
+        "config": {
+            "tone": rewriter._default_config.tone.value,
+            "use_contractions": rewriter._default_config.use_contractions,
+            "add_sir": rewriter._default_config.add_sir,
+            "wit_level": rewriter._default_config.wit_level,
+            "formality_level": rewriter._default_config.formality_level,
+        }
+    }
+
+
 async def listen_for_utterances():
     """
     Background task that listens to utterance events from Redis.
@@ -310,9 +410,33 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
                 response_latency_ms
             )
         
-        # Step 5: Apply personality/wit module (STUB)
-        # Note: Personality is typically applied in handlers, but we can enhance here if needed
-        response_text = await apply_personality(handler_response.text, intent)
+        # Step 5: Apply personality/wit module
+        if settings.personality_enable_rewrite:
+            # Check for tone override in context or metadata
+            tone_override = None
+            config_override = None
+            
+            # Check metadata for tone override
+            if handler_response.metadata:
+                tone_str = handler_response.metadata.get("tone_override")
+                if tone_str:
+                    try:
+                        tone_override = TonePreset(tone_str.lower())
+                    except ValueError:
+                        logger.warning(f"Invalid tone override: {tone_str}")
+                
+                # Check for config overrides
+                if "personality_config" in handler_response.metadata:
+                    config_override = handler_response.metadata["personality_config"]
+            
+            response_text = await rewrite_with_personality(
+                handler_response.text,
+                tone_override=tone_override,
+                config_override=config_override,
+                settings=settings
+            )
+        else:
+            response_text = handler_response.text
         
         # Step 6: Emit action_spec if needed
         # Use action_spec from handler if available, otherwise create from routing decision
@@ -572,12 +696,12 @@ async def generate_response(text: str, intent: str, context: dict) -> str:
 async def apply_personality(response: str, intent: str) -> str:
     """
     Apply personality/wit module to make response more natural and Jarvis-like.
-    TODO: Implement personality layer.
-    """
-    logger.info("[STUB] Applying personality layer")
     
-    # Response already has personality, just return it
-    # (Avoid double-prefixing since generate_response already adds it)
+    This function is kept for backward compatibility.
+    Use rewrite_with_personality() directly for more control.
+    """
+    if settings.personality_enable_rewrite:
+        return await rewrite_with_personality(response, settings=settings)
     return response
 
 

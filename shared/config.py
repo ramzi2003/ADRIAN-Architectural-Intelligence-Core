@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     llm_persona_default: str = "jarvis"
     llm_warmup_prompt: str = "Explain the mission of project ADRIAN in one sentence."
     
+    # Personality & Wit Module
+    personality_default_tone: str = "jarvis"  # jarvis, formal, minimal, friendly, sarcastic, professional
+    personality_use_contractions: bool = True
+    personality_add_sir: bool = True
+    personality_wit_level: int = 2  # 0=none, 1=subtle, 2=moderate, 3=high
+    personality_formality_level: int = 2  # 0=very casual, 1=casual, 2=neutral, 3=formal, 4=very formal
+    personality_max_length_multiplier: float = 1.2
+    personality_enable_rewrite: bool = True
+    
     # Intent Classifier
     intent_classifier_model_path: str = "models/intent_classifier"
     intent_classifier_device: str = "cpu"

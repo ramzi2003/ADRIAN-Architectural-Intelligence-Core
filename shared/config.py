@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     llm_repeat_penalty: float = 1.1
     llm_persona_default: str = "jarvis"
     llm_warmup_prompt: str = "Explain the mission of project ADRIAN in one sentence."
+    llm_enabled: bool = True  # Enable/disable LLM generation
+    llm_streaming_enabled: bool = True  # Enable streaming responses
+    llm_timeout_seconds: float = 30.0  # Timeout for LLM requests
     
     # Personality & Wit Module
     personality_default_tone: str = "jarvis"  # jarvis, formal, minimal, friendly, sarcastic, professional
@@ -74,6 +77,8 @@ class Settings(BaseSettings):
         "conversation",
     )
     intent_classifier_enable_context: bool = True
+    intent_classifier_enabled: bool = True  # Enable/disable intent classifier
+    intent_classifier_fallback_to_heuristics: bool = True  # Use heuristics if model fails
     
     # Routing Controller
     routing_direct_handler_intents: tuple[str, ...] = ("system_control",)
@@ -81,6 +86,8 @@ class Settings(BaseSettings):
     routing_llm_required_intents: tuple[str, ...] = ("conversation", "search")
     routing_enable_metrics: bool = True
     routing_metrics_history_size: int = 100
+    routing_confidence_threshold: float = 0.7  # Minimum confidence for direct handler routing
+    routing_fallback_to_llm: bool = True  # Fallback to LLM if handler fails
     
     # Porcupine (Hotword Detection)
     picovoice_access_key: Optional[str] = None

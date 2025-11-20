@@ -16,7 +16,8 @@ import httpx
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
+from typing import List
 from pydantic import BaseModel
 
 from shared.config import get_settings
@@ -267,6 +268,7 @@ async def update_personality_config(
     add_sir: Optional[bool] = None,
     wit_level: Optional[int] = None,
     formality_level: Optional[int] = None,
+    default_tone: Optional[str] = None,
 ):
     """
     Update personality configuration.
@@ -276,20 +278,36 @@ async def update_personality_config(
         add_sir: Whether to add "Sir" to responses
         wit_level: Wit level (0-3)
         formality_level: Formality level (0-4)
+        default_tone: Default tone preset (jarvis, formal, minimal, friendly, sarcastic, professional)
     
     Returns:
         Updated configuration
     """
     rewriter = get_personality_rewriter(settings)
     
+    if default_tone is not None:
+        try:
+            tone_preset = TonePreset(default_tone.lower())
+            rewriter._default_config.tone = tone_preset
+            # Also update settings for persistence
+            settings.personality_default_tone = tone_preset.value
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid tone: {default_tone}. Must be one of: {[t.value for t in TonePreset]}"
+            )
     if use_contractions is not None:
         rewriter._default_config.use_contractions = use_contractions
+        settings.personality_use_contractions = use_contractions
     if add_sir is not None:
         rewriter._default_config.add_sir = add_sir
+        settings.personality_add_sir = add_sir
     if wit_level is not None:
         rewriter._default_config.wit_level = max(0, min(3, wit_level))
+        settings.personality_wit_level = rewriter._default_config.wit_level
     if formality_level is not None:
         rewriter._default_config.formality_level = max(0, min(4, formality_level))
+        settings.personality_formality_level = rewriter._default_config.formality_level
     
     return {
         "status": "success",
@@ -299,6 +317,316 @@ async def update_personality_config(
             "add_sir": rewriter._default_config.add_sir,
             "wit_level": rewriter._default_config.wit_level,
             "formality_level": rewriter._default_config.formality_level,
+        }
+    }
+
+
+@app.get("/config/nlp")
+async def get_nlp_config():
+    """Get all NLP, intent, and personality configuration settings."""
+    rewriter = get_personality_rewriter(settings)
+    
+    return {
+        "personality": {
+            "default_tone": settings.personality_default_tone,
+            "use_contractions": settings.personality_use_contractions,
+            "add_sir": settings.personality_add_sir,
+            "wit_level": settings.personality_wit_level,
+            "formality_level": settings.personality_formality_level,
+            "max_length_multiplier": settings.personality_max_length_multiplier,
+            "enable_rewrite": settings.personality_enable_rewrite,
+            "available_tones": [t.value for t in TonePreset],
+        },
+        "intent_classifier": {
+            "model_path": settings.intent_classifier_model_path,
+            "device": settings.intent_classifier_device,
+            "confidence_threshold": settings.intent_classifier_confidence_threshold,
+            "low_confidence_route": settings.intent_classifier_low_confidence_route,
+            "label_map": list(settings.intent_classifier_label_map),
+            "enable_context": settings.intent_classifier_enable_context,
+            "enabled": settings.intent_classifier_enabled,
+            "fallback_to_heuristics": settings.intent_classifier_fallback_to_heuristics,
+        },
+        "routing": {
+            "direct_handler_intents": list(settings.routing_direct_handler_intents),
+            "deferred_task_intents": list(settings.routing_deferred_task_intents),
+            "llm_required_intents": list(settings.routing_llm_required_intents),
+            "enable_metrics": settings.routing_enable_metrics,
+            "metrics_history_size": settings.routing_metrics_history_size,
+            "confidence_threshold": settings.routing_confidence_threshold,
+            "fallback_to_llm": settings.routing_fallback_to_llm,
+        },
+        "llm": {
+            "provider": settings.llm_provider,
+            "model_name": settings.llm_model_name,
+            "model_path": settings.llm_model_path,
+            "ollama_host": settings.ollama_host,
+            "ollama_model": settings.ollama_model,
+            "gemini_model": settings.gemini_model,
+            "thread_count": settings.llm_thread_count,
+            "gpu_layers": settings.llm_gpu_layers,
+            "context_window": settings.llm_context_window,
+            "max_output_tokens": settings.llm_max_output_tokens,
+            "temperature": settings.llm_temperature,
+            "top_p": settings.llm_top_p,
+            "top_k": settings.llm_top_k,
+            "repeat_penalty": settings.llm_repeat_penalty,
+            "persona_default": settings.llm_persona_default,
+            "enabled": settings.llm_enabled,
+            "streaming_enabled": settings.llm_streaming_enabled,
+            "timeout_seconds": settings.llm_timeout_seconds,
+        }
+    }
+
+
+@app.post("/config/routing")
+async def update_routing_config(
+    direct_handler_intents: Optional[List[str]] = Body(None),
+    deferred_task_intents: Optional[List[str]] = Body(None),
+    llm_required_intents: Optional[List[str]] = Body(None),
+    confidence_threshold: Optional[float] = Body(None),
+    fallback_to_llm: Optional[bool] = Body(None),
+):
+    """
+    Update routing configuration (default intent routes).
+    
+    Args:
+        direct_handler_intents: List of intents that should use direct handlers
+        deferred_task_intents: List of intents that should be deferred
+        llm_required_intents: List of intents that require LLM
+        confidence_threshold: Minimum confidence for direct handler routing
+        fallback_to_llm: Whether to fallback to LLM if handler fails
+    
+    Returns:
+        Updated routing configuration
+    """
+    if direct_handler_intents is not None:
+        settings.routing_direct_handler_intents = tuple(direct_handler_intents)
+    if deferred_task_intents is not None:
+        settings.routing_deferred_task_intents = tuple(deferred_task_intents)
+    if llm_required_intents is not None:
+        settings.routing_llm_required_intents = tuple(llm_required_intents)
+    if confidence_threshold is not None:
+        settings.routing_confidence_threshold = max(0.0, min(1.0, confidence_threshold))
+    if fallback_to_llm is not None:
+        settings.routing_fallback_to_llm = fallback_to_llm
+    
+    # Reload routing controller to pick up changes
+    # Reset the singleton by creating a new instance
+    from services.processing_service.routing_controller import RoutingController
+    global _routing_controller
+    _routing_controller = RoutingController(settings)
+    logger.info("Routing controller reloaded with new configuration")
+    
+    return {
+        "status": "success",
+        "routing": {
+            "direct_handler_intents": list(settings.routing_direct_handler_intents),
+            "deferred_task_intents": list(settings.routing_deferred_task_intents),
+            "llm_required_intents": list(settings.routing_llm_required_intents),
+            "confidence_threshold": settings.routing_confidence_threshold,
+            "fallback_to_llm": settings.routing_fallback_to_llm,
+        }
+    }
+
+
+@app.get("/config/routing")
+async def get_routing_config():
+    """Get current routing configuration."""
+    return {
+        "direct_handler_intents": list(settings.routing_direct_handler_intents),
+        "deferred_task_intents": list(settings.routing_deferred_task_intents),
+        "llm_required_intents": list(settings.routing_llm_required_intents),
+        "enable_metrics": settings.routing_enable_metrics,
+        "metrics_history_size": settings.routing_metrics_history_size,
+        "confidence_threshold": settings.routing_confidence_threshold,
+        "fallback_to_llm": settings.routing_fallback_to_llm,
+    }
+
+
+@app.post("/config/model")
+async def update_model_selection(
+    provider: Optional[str] = Body(None),
+    model_name: Optional[str] = Body(None),
+    model_path: Optional[str] = Body(None),
+    ollama_model: Optional[str] = Body(None),
+    ollama_host: Optional[str] = Body(None),
+    gemini_model: Optional[str] = Body(None),
+    temperature: Optional[float] = Body(None),
+    max_output_tokens: Optional[int] = Body(None),
+    context_window: Optional[int] = Body(None),
+):
+    """
+    Update model selection and LLM configuration.
+    
+    Args:
+        provider: LLM provider (llama_cpp, ollama, gemini)
+        model_name: Model name for llama_cpp
+        model_path: Path to model file for llama_cpp
+        ollama_model: Model name for Ollama
+        ollama_host: Ollama host URL
+        gemini_model: Gemini model name
+        temperature: Generation temperature (0.0-2.0)
+        max_output_tokens: Maximum output tokens
+        context_window: Context window size
+    
+    Returns:
+        Updated model configuration
+    """
+    if provider is not None:
+        if provider.lower() not in ["llama_cpp", "ollama", "gemini"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid provider: {provider}. Must be one of: llama_cpp, ollama, gemini"
+            )
+        settings.llm_provider = provider.lower()
+    
+    if model_name is not None:
+        settings.llm_model_name = model_name
+    if model_path is not None:
+        settings.llm_model_path = model_path
+    if ollama_model is not None:
+        settings.ollama_model = ollama_model
+    if ollama_host is not None:
+        settings.ollama_host = ollama_host
+    if gemini_model is not None:
+        settings.gemini_model = gemini_model
+    if temperature is not None:
+        settings.llm_temperature = max(0.0, min(2.0, temperature))
+    if max_output_tokens is not None:
+        settings.llm_max_output_tokens = max(1, max_output_tokens)
+    if context_window is not None:
+        settings.llm_context_window = max(512, context_window)
+    
+    # Note: Model changes require service restart to take effect
+    # We log a warning but don't reload the runtime here
+    logger.warning(
+        "Model configuration updated. Service restart required for changes to take effect."
+    )
+    
+    return {
+        "status": "success",
+        "message": "Model configuration updated. Service restart required.",
+        "model": {
+            "provider": settings.llm_provider,
+            "model_name": settings.llm_model_name,
+            "model_path": settings.llm_model_path,
+            "ollama_host": settings.ollama_host,
+            "ollama_model": settings.ollama_model,
+            "gemini_model": settings.gemini_model,
+            "temperature": settings.llm_temperature,
+            "max_output_tokens": settings.llm_max_output_tokens,
+            "context_window": settings.llm_context_window,
+        }
+    }
+
+
+@app.get("/config/model")
+async def get_model_selection():
+    """Get current model selection and LLM configuration."""
+    return {
+        "provider": settings.llm_provider,
+        "model_name": settings.llm_model_name,
+        "model_path": settings.llm_model_path,
+        "ollama_host": settings.ollama_host,
+        "ollama_model": settings.ollama_model,
+        "gemini_model": settings.gemini_model,
+        "thread_count": settings.llm_thread_count,
+        "gpu_layers": settings.llm_gpu_layers,
+        "context_window": settings.llm_context_window,
+        "max_output_tokens": settings.llm_max_output_tokens,
+        "temperature": settings.llm_temperature,
+        "top_p": settings.llm_top_p,
+        "top_k": settings.llm_top_k,
+        "repeat_penalty": settings.llm_repeat_penalty,
+        "persona_default": settings.llm_persona_default,
+        "enabled": settings.llm_enabled,
+        "streaming_enabled": settings.llm_streaming_enabled,
+        "timeout_seconds": settings.llm_timeout_seconds,
+    }
+
+
+@app.get("/config/intent")
+async def get_intent_config():
+    """Get current intent classifier configuration."""
+    return {
+        "model_path": settings.intent_classifier_model_path,
+        "device": settings.intent_classifier_device,
+        "confidence_threshold": settings.intent_classifier_confidence_threshold,
+        "low_confidence_route": settings.intent_classifier_low_confidence_route,
+        "label_map": list(settings.intent_classifier_label_map),
+        "enable_context": settings.intent_classifier_enable_context,
+        "enabled": settings.intent_classifier_enabled,
+        "fallback_to_heuristics": settings.intent_classifier_fallback_to_heuristics,
+    }
+
+
+@app.post("/config/intent")
+async def update_intent_config(
+    model_path: Optional[str] = Body(None),
+    device: Optional[str] = Body(None),
+    confidence_threshold: Optional[float] = Body(None),
+    low_confidence_route: Optional[str] = Body(None),
+    label_map: Optional[List[str]] = Body(None),
+    enable_context: Optional[bool] = Body(None),
+    enabled: Optional[bool] = Body(None),
+    fallback_to_heuristics: Optional[bool] = Body(None),
+):
+    """
+    Update intent classifier configuration.
+    
+    Args:
+        model_path: Path to intent classifier model
+        device: Device to run classifier on (cpu, cuda)
+        confidence_threshold: Minimum confidence threshold (0.0-1.0)
+        low_confidence_route: Route to use for low confidence predictions
+        label_map: List of intent labels
+        enable_context: Whether to use conversation context
+        enabled: Enable/disable intent classifier
+        fallback_to_heuristics: Use heuristics if model fails
+    
+    Returns:
+        Updated intent classifier configuration
+    """
+    if model_path is not None:
+        settings.intent_classifier_model_path = model_path
+    if device is not None:
+        if device.lower() not in ["cpu", "cuda"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid device: {device}. Must be one of: cpu, cuda"
+            )
+        settings.intent_classifier_device = device.lower()
+    if confidence_threshold is not None:
+        settings.intent_classifier_confidence_threshold = max(0.0, min(1.0, confidence_threshold))
+    if low_confidence_route is not None:
+        settings.intent_classifier_low_confidence_route = low_confidence_route
+    if label_map is not None:
+        settings.intent_classifier_label_map = tuple(label_map)
+    if enable_context is not None:
+        settings.intent_classifier_enable_context = enable_context
+    if enabled is not None:
+        settings.intent_classifier_enabled = enabled
+    if fallback_to_heuristics is not None:
+        settings.intent_classifier_fallback_to_heuristics = fallback_to_heuristics
+    
+    # Note: Model path/device changes require service restart
+    if model_path is not None or device is not None:
+        logger.warning(
+            "Intent classifier model/device updated. Service restart required."
+        )
+    
+    return {
+        "status": "success",
+        "intent_classifier": {
+            "model_path": settings.intent_classifier_model_path,
+            "device": settings.intent_classifier_device,
+            "confidence_threshold": settings.intent_classifier_confidence_threshold,
+            "low_confidence_route": settings.intent_classifier_low_confidence_route,
+            "label_map": list(settings.intent_classifier_label_map),
+            "enable_context": settings.intent_classifier_enable_context,
+            "enabled": settings.intent_classifier_enabled,
+            "fallback_to_heuristics": settings.intent_classifier_fallback_to_heuristics,
         }
     }
 

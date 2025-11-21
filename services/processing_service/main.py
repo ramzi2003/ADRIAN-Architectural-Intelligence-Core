@@ -811,6 +811,33 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
         # Step 7: Emit response_text
         # Extract emotion from handler metadata if available
         emotion = handler_response.metadata.get("emotion")
+        
+        # Get processing metrics for this conversation
+        processing_metadata = {}
+        if _processing_metrics:
+            metrics = _processing_metrics._conversations.get(correlation_id)
+            if metrics:
+                processing_metadata = {
+                    "intent": metrics.intent,
+                    "intent_confidence": metrics.confidence,
+                    "route_type": metrics.route_type.value if metrics.route_type else None,
+                    "route_reason": metrics.route_reason,
+                    "intent_classification_latency_ms": None,
+                    "routing_decision_latency_ms": None,
+                    "llm_latency_ms": metrics.llm_latency_ms,
+                    "response_generation_latency_ms": None,
+                }
+                # Calculate latencies from history if available
+                if _processing_metrics._latency_history["intent_classification"]:
+                    processing_metadata["intent_classification_latency_ms"] = \
+                        _processing_metrics._latency_history["intent_classification"][-1]
+                if _processing_metrics._latency_history["routing_decision"]:
+                    processing_metadata["routing_decision_latency_ms"] = \
+                        _processing_metrics._latency_history["routing_decision"][-1]
+                if _processing_metrics._latency_history["response_generation"]:
+                    processing_metadata["response_generation_latency_ms"] = \
+                        _processing_metrics._latency_history["response_generation"][-1]
+        
         response = ResponseText(
             message_id=str(uuid.uuid4()),
             correlation_id=correlation_id,
@@ -818,7 +845,10 @@ async def process_utterance(text: str, user_id: str, correlation_id: Optional[st
             should_speak=True,
             emotion=emotion
         )
-        await redis_client.publish("responses", response)
+        # Add processing metrics to response (via model_dump and update)
+        response_dict = response.model_dump()
+        response_dict["metadata"] = processing_metadata
+        await redis_client.publish("responses", response_dict)
         logger.info(f"Published response: '{response_text}'")
         
         # Record completion
@@ -923,7 +953,7 @@ async def execute_route(
         except ValueError:
             # No handler found, fallback to LLM
             logger.warning(f"No handler for intent '{intent}', falling back to LLM")
-            response_text = await generate_response(text, intent, context)
+            response_text = await generate_response(text, intent, context, correlation_id)
             return HandlerResponse(
                 text=response_text,
                 action_spec=None,
@@ -939,12 +969,12 @@ async def execute_route(
             handler_response = await handler.handle(text, parameters, context)
             # For conversation intents, enhance with LLM
             if intent == "conversation" or handler_response.metadata.get("requires_llm"):
-                llm_text = await generate_response(text, intent, context)
+                llm_text = await generate_response(text, intent, context, correlation_id)
                 handler_response.text = llm_text
             return handler_response
         else:
             # No handler, use LLM directly
-            response_text = await generate_response(text, intent, context)
+            response_text = await generate_response(text, intent, context, correlation_id)
             return HandlerResponse(
                 text=response_text,
                 action_spec=None,
@@ -961,7 +991,7 @@ async def execute_route(
             return handler_response
         except ValueError:
             # Fallback to LLM
-            response_text = await generate_response(text, intent, context)
+            response_text = await generate_response(text, intent, context, correlation_id)
             return HandlerResponse(
                 text=response_text,
                 action_spec=None,
@@ -971,7 +1001,7 @@ async def execute_route(
     else:
         # Fallback to LLM
         logger.warning(f"Unknown route type {decision.route_type}, falling back to LLM")
-        response_text = await generate_response(text, intent, context)
+        response_text = await generate_response(text, intent, context, correlation_id)
         return HandlerResponse(
             text=response_text,
             action_spec=None,
@@ -979,13 +1009,28 @@ async def execute_route(
         )
 
 
-async def generate_response(text: str, intent: str, context: dict) -> str:
+async def generate_response(
+    text: str, 
+    intent: str, 
+    context: dict,
+    correlation_id: Optional[str] = None
+) -> str:
     """
     Generate response text using LLM (Ollama or Gemini).
     TODO: Implement actual LLM call.
     """
-    logger.info(f"[STUB] Generating response for intent: {intent}")
+    logger.info(f"Generating response for intent: {intent}", extra={
+        "extra_data": {
+            "intent": intent,
+            "correlation_id": correlation_id,
+            "text_length": len(text)
+        }
+    })
     llm_provider = settings.llm_provider.lower()
+    
+    start_time = time.perf_counter()
+    provider_used = None
+    tokens_generated = None
 
     if llm_provider == "llama_cpp":
         prompt = build_structured_prompt(text, intent, context)
@@ -995,18 +1040,77 @@ async def generate_response(text: str, intent: str, context: dict) -> str:
         else:
             try:
                 generated = await runtime.generate(prompt)
+                provider_used = "llama_cpp"
+                tokens_generated = len(generated.split())  # Approximate token count
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                
+                # Record LLM usage metrics
+                if _processing_metrics and correlation_id:
+                    _processing_metrics.record_llm_usage(
+                        correlation_id,
+                        latency_ms,
+                        tokens_generated=tokens_generated,
+                        provider=provider_used
+                    )
+                
+                logger.info(f"LLM generation completed", extra={
+                    "extra_data": {
+                        "provider": provider_used,
+                        "latency_ms": round(latency_ms, 2),
+                        "tokens_generated": tokens_generated,
+                        "correlation_id": correlation_id
+                    }
+                })
+                
                 return generated.strip()
             except LLMRuntimeError as exc:
-                logger.error("Local LLM generation failed: %s", exc)
+                logger.error("Local LLM generation failed: %s", exc, extra={
+                    "extra_data": {
+                        "correlation_id": correlation_id,
+                        "error": str(exc)
+                    }
+                })
             except Exception as exc:  # pragma: no cover
-                logger.exception("Unexpected LLM error: %s", exc)
+                logger.exception("Unexpected LLM error: %s", exc, extra={
+                    "extra_data": {
+                        "correlation_id": correlation_id,
+                        "error": str(exc)
+                    }
+                })
 
     if llm_provider == "ollama":
         try:
             response = await call_ollama(text, context)
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            provider_used = "ollama"
+            tokens_generated = len(response.split())  # Approximate token count
+            
+            # Record LLM usage metrics
+            if _processing_metrics and correlation_id:
+                _processing_metrics.record_llm_usage(
+                    correlation_id,
+                    latency_ms,
+                    tokens_generated=tokens_generated,
+                    provider=provider_used
+                )
+            
+            logger.info(f"Ollama generation completed", extra={
+                "extra_data": {
+                    "provider": provider_used,
+                    "latency_ms": round(latency_ms, 2),
+                    "tokens_generated": tokens_generated,
+                    "correlation_id": correlation_id
+                }
+            })
+            
             return response
         except Exception as e:
-            logger.warning(f"Ollama call failed: {e}, falling back to echo response")
+            logger.warning(f"Ollama call failed: {e}, falling back to echo response", extra={
+                "extra_data": {
+                    "correlation_id": correlation_id,
+                    "error": str(e)
+                }
+            })
 
     # Echo response for testing - confirms it heard you correctly
     text_lower = text.lower()

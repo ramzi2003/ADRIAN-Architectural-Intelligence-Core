@@ -23,6 +23,16 @@ class ConversationMetrics:
     confidence: Optional[float] = None
     retries: int = 0
     errors: List[str] = field(default_factory=list)
+    
+    # Processing metrics (from processing service)
+    intent: Optional[str] = None
+    intent_confidence: Optional[float] = None
+    route_type: Optional[str] = None
+    route_reason: Optional[str] = None
+    llm_latency_ms: Optional[float] = None
+    intent_classification_latency_ms: Optional[float] = None
+    routing_decision_latency_ms: Optional[float] = None
+    response_generation_latency_ms: Optional[float] = None
 
     def stage_latency_ms(self, stage_time: float) -> Optional[float]:
         if stage_time <= 0 or self.hotword_at <= 0:
@@ -43,7 +53,17 @@ class VoicePipelineMetrics:
             "hotword_to_tts_start": deque(maxlen=50),
             "hotword_to_tts_end": deque(maxlen=50),
             "tts_duration": deque(maxlen=50),
+            "intent_classification": deque(maxlen=50),
+            "routing_decision": deque(maxlen=50),
+            "llm_latency": deque(maxlen=50),
+            "response_generation": deque(maxlen=50),
         }
+        
+        # Classifier confidence history
+        self._confidence_history: Deque[float] = deque(maxlen=50)
+        
+        # Route decision distribution
+        self._route_distribution: Dict[str, int] = {}
         self._events: Deque[dict] = deque(maxlen=25)
         self.total_conversations: int = 0
         self.total_interrupts: int = 0
@@ -89,6 +109,37 @@ class VoicePipelineMetrics:
                 latency_ms = metrics.stage_latency_ms(metrics.response_received_at)
                 if latency_ms is not None:
                     self._latency_history["hotword_to_response"].append(latency_ms)
+                
+                # Store processing metrics if provided
+                if "intent" in kwargs:
+                    metrics.intent = kwargs.get("intent")
+                if "intent_confidence" in kwargs:
+                    metrics.intent_confidence = kwargs.get("intent_confidence")
+                    if metrics.intent_confidence is not None:
+                        self._confidence_history.append(metrics.intent_confidence)
+                if "route_type" in kwargs:
+                    metrics.route_type = kwargs.get("route_type")
+                    if metrics.route_type:
+                        self._route_distribution[metrics.route_type] = \
+                            self._route_distribution.get(metrics.route_type, 0) + 1
+                if "route_reason" in kwargs:
+                    metrics.route_reason = kwargs.get("route_reason")
+                if "intent_classification_latency_ms" in kwargs:
+                    metrics.intent_classification_latency_ms = kwargs.get("intent_classification_latency_ms")
+                    if metrics.intent_classification_latency_ms is not None:
+                        self._latency_history["intent_classification"].append(metrics.intent_classification_latency_ms)
+                if "routing_decision_latency_ms" in kwargs:
+                    metrics.routing_decision_latency_ms = kwargs.get("routing_decision_latency_ms")
+                    if metrics.routing_decision_latency_ms is not None:
+                        self._latency_history["routing_decision"].append(metrics.routing_decision_latency_ms)
+                if "llm_latency_ms" in kwargs:
+                    metrics.llm_latency_ms = kwargs.get("llm_latency_ms")
+                    if metrics.llm_latency_ms is not None:
+                        self._latency_history["llm_latency"].append(metrics.llm_latency_ms)
+                if "response_generation_latency_ms" in kwargs:
+                    metrics.response_generation_latency_ms = kwargs.get("response_generation_latency_ms")
+                    if metrics.response_generation_latency_ms is not None:
+                        self._latency_history["response_generation"].append(metrics.response_generation_latency_ms)
             elif stage == "tts_started":
                 metrics.tts_started_at = now
                 latency_ms = metrics.stage_latency_ms(metrics.tts_started_at)
@@ -127,6 +178,9 @@ class VoicePipelineMetrics:
             def avg(values: Deque[float]) -> float:
                 return round(sum(values) / len(values), 2) if values else 0.0
 
+            def avg_confidence() -> float:
+                return round(sum(self._confidence_history) / len(self._confidence_history), 3) if self._confidence_history else 0.0
+            
             summary = {
                 "latency_target_ms": self.latency_target_ms,
                 "averages": {
@@ -135,6 +189,17 @@ class VoicePipelineMetrics:
                     "hotword_to_tts_start": avg(self._latency_history["hotword_to_tts_start"]),
                     "hotword_to_tts_end": avg(self._latency_history["hotword_to_tts_end"]),
                     "tts_duration": avg(self._latency_history["tts_duration"]),
+                    "intent_classification": avg(self._latency_history["intent_classification"]),
+                    "routing_decision": avg(self._latency_history["routing_decision"]),
+                    "llm_latency": avg(self._latency_history["llm_latency"]),
+                    "response_generation": avg(self._latency_history["response_generation"]),
+                },
+                "classifier": {
+                    "average_confidence": avg_confidence(),
+                    "confidence_samples": len(self._confidence_history),
+                },
+                "routing": {
+                    "route_distribution": dict(self._route_distribution),
                 },
                 "history": list(self._events),
                 "active_conversations": len(self._conversations),

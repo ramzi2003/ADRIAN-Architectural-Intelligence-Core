@@ -33,6 +33,11 @@ class ProcessingMetrics:
     direct_handler_used: bool = False
     deferred_task: bool = False
     
+    # LLM-specific metrics
+    llm_latency_ms: Optional[float] = None
+    llm_tokens_generated: Optional[int] = None
+    llm_provider: Optional[str] = None
+    
     errors: List[str] = field(default_factory=list)
 
 
@@ -49,7 +54,11 @@ class ProcessingServiceMetrics:
             "routing_decision": deque(maxlen=100),
             "response_generation": deque(maxlen=100),
             "total_processing": deque(maxlen=100),
+            "llm_latency": deque(maxlen=100),
         }
+        
+        # Classifier confidence history
+        self._confidence_history: Deque[float] = deque(maxlen=100)
         
         # Route decision counters
         self._route_counts: Dict[RouteType, int] = {
@@ -95,6 +104,9 @@ class ProcessingServiceMetrics:
                 
                 # Track intent distribution
                 self._intent_counts[intent] = self._intent_counts.get(intent, 0) + 1
+                
+                # Track confidence history
+                self._confidence_history.append(confidence)
                 
                 self._store_event(correlation_id, "intent_classified", {
                     "intent": intent,
@@ -145,6 +157,29 @@ class ProcessingServiceMetrics:
                     "latency_ms": latency_ms
                 })
     
+    def record_llm_usage(
+        self,
+        correlation_id: str,
+        latency_ms: float,
+        tokens_generated: Optional[int] = None,
+        provider: Optional[str] = None
+    ):
+        """Record LLM usage metrics."""
+        with self._lock:
+            metrics = self._conversations.get(correlation_id)
+            if metrics:
+                metrics.llm_used = True
+                metrics.llm_latency_ms = latency_ms
+                metrics.llm_tokens_generated = tokens_generated
+                metrics.llm_provider = provider
+                self._latency_history["llm_latency"].append(latency_ms)
+                
+                self._store_event(correlation_id, "llm_used", {
+                    "latency_ms": latency_ms,
+                    "tokens_generated": tokens_generated,
+                    "provider": provider
+                })
+    
     def finish_conversation(self, correlation_id: str, total_latency_ms: float):
         """Mark conversation as complete."""
         with self._lock:
@@ -192,6 +227,9 @@ class ProcessingServiceMetrics:
             def avg(values: Deque[float]) -> float:
                 return round(sum(values) / len(values), 2) if values else 0.0
             
+            def avg_confidence() -> float:
+                return round(sum(self._confidence_history) / len(self._confidence_history), 3) if self._confidence_history else 0.0
+            
             summary = {
                 "total_processed": self.total_processed,
                 "active_conversations": len(self._conversations),
@@ -201,6 +239,11 @@ class ProcessingServiceMetrics:
                     "routing_decision_ms": avg(self._latency_history["routing_decision"]),
                     "response_generation_ms": avg(self._latency_history["response_generation"]),
                     "total_processing_ms": avg(self._latency_history["total_processing"]),
+                    "llm_latency_ms": avg(self._latency_history["llm_latency"]),
+                },
+                "classifier": {
+                    "average_confidence": avg_confidence(),
+                    "confidence_samples": len(self._confidence_history),
                 },
                 "route_distribution": {
                     route.value: count

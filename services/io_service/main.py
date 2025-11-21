@@ -374,10 +374,20 @@ async def _handle_response_messages():
             if response.should_speak and audio_stream and audio_stream.is_running:
                 correlation_id = response.correlation_id
                 if pipeline_metrics and settings.pipeline_metrics_enabled:
+                    # Get processing metrics from response metadata if available
+                    processing_metrics = getattr(response, 'metadata', {}) or {}
                     pipeline_metrics.record_stage(
                         correlation_id,
                         "response_received",
-                        response_text=response.text
+                        response_text=response.text,
+                        intent=processing_metrics.get("intent"),
+                        intent_confidence=processing_metrics.get("intent_confidence"),
+                        route_type=processing_metrics.get("route_type"),
+                        route_reason=processing_metrics.get("route_reason"),
+                        intent_classification_latency_ms=processing_metrics.get("intent_classification_latency_ms"),
+                        routing_decision_latency_ms=processing_metrics.get("routing_decision_latency_ms"),
+                        llm_latency_ms=processing_metrics.get("llm_latency_ms"),
+                        response_generation_latency_ms=processing_metrics.get("response_generation_latency_ms"),
                     )
 
                 word_count = len(response.text.split())

@@ -175,7 +175,6 @@ This is a personal project currently in active development. Contributions, sugge
 
 ---
 
----
 
 ## 🙏 Acknowledgments
 

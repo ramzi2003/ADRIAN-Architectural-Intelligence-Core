@@ -175,10 +175,6 @@ This is a personal project currently in active development. Contributions, sugge
 
 ---
 
-## 📄 License
-
-[Specify your license here]
-
 ---
 
 ## 🙏 Acknowledgments
